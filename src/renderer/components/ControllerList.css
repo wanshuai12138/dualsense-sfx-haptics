@@ -1,0 +1,99 @@
+.controller-list {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+
+.controller-item {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  padding: 15px;
+  background: #f8f9fa;
+  border: 2px solid #e0e0e0;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.controller-item:hover {
+  background: #f0f2f5;
+  border-color: #667eea;
+}
+
+.controller-item.selected {
+  background: #e8ecff;
+  border-color: #667eea;
+  box-shadow: 0 2px 8px rgba(102, 126, 234, 0.15);
+}
+
+.controller-icon {
+  font-size: 2rem;
+  flex-shrink: 0;
+}
+
+.controller-info {
+  flex: 1;
+}
+
+.controller-info h3 {
+  margin: 0;
+  color: #333;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.controller-info p {
+  margin: 5px 0 0;
+  font-size: 0.85rem;
+  color: #666;
+}
+
+.serial {
+  font-size: 0.8rem !important;
+  color: #999 !important;
+  font-family: monospace;
+}
+
+.status {
+  margin-top: 8px !important;
+}
+
+.status-badge {
+  display: inline-block;
+  padding: 4px 8px;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  background: #e0ffe0;
+  color: #00aa00;
+}
+
+.select-indicator {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border-radius: 50%;
+}
+
+.controller-item.selected .select-indicator {
+  background: #667eea;
+  color: white;
+}
+
+.checkmark {
+  font-weight: bold;
+}
+
+.empty-state {
+  text-align: center;
+  padding: 40px 20px;
+  color: #999;
+}
+
+.empty-state p {
+  margin: 0;
+}

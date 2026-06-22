@@ -1,0 +1,57 @@
+{
+  "name": "dualsense-vibration-tool",
+  "version": "1.0.0",
+  "description": "Sony DualSense 5 手柄震动辅助工具 - 用于游戏增强和自定义震动效果",
+  "main": "src/main/main.js",
+  "homepage": "./",
+  "author": "Your Name",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dev": "cross-env NODE_ENV=development concurrently \"npm run react-start\" \"wait-on http://localhost:3000 && npm run electron-dev\"",
+    "react-start": "react-scripts start",
+    "react-build": "react-scripts build",
+    "electron-dev": "electron . --watch",
+    "build": "npm run react-build && electron-builder",
+    "eject": "react-scripts eject"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-scripts": "5.0.1",
+    "node-hid": "^2.2.0",
+    "electron-is-dev": "^2.0.0",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "electron": "^27.0.0",
+    "electron-builder": "^24.0.0",
+    "concurrently": "^7.0.0",
+    "cross-env": "^7.0.3",
+    "wait-on": "^7.0.0"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "build": {
+    "appId": "com.dualsense.vibration",
+    "productName": "DualSense 震动工具",
+    "files": [
+      "build/**/*",
+      "src/main/**/*",
+      "node_modules/**/*"
+    ],
+    "directories": {
+      "buildResources": "public"
+    }
+  }
+}
