@@ -208,7 +208,7 @@ dualsense-sounds/
 > ⚠️ 修正：v0.1.0 阶段曾以为战斗音在 `sm##.fsb`，实际 `sm=music`，战斗音在 `smain.fsb`。
 
 ### 4. 社区现成资源（留作将来精调弹药，当前不依赖）
-- FSB 解密 key：`G0KTrWjS9syqF7vVD6RaVXlFD91gMgkC` + 工具 FSBExt（**本项目运行时用不到**，游戏自己解密，我们只读 API 里的明文文件名）
+- FSB 解密/提取工具 FSBExt（**本项目运行时用不到**，游戏自己解密，我们只读 API 里的明文文件名）。解密密钥**刻意不在本仓库记录**，避免分发规避技术保护措施的内容。
 - `main.fsb` 的 ID→含义对照表（关键：**670–673 = 格挡音**；401–402 水月反击；487–664 脚步；983–992 受伤死亡 等）
 - Nexus mod：Sekiro Sound Debug Labels（念出 ID）、Sound Effect Helper（分段静音二分查找）
 
