@@ -1,6 +1,8 @@
-// 细腻触觉输出：WASAPI 独占 → DualSense 音频设备 ch3/4 渲染被电平调制的 ~100Hz 载波。
-// 电平 = 音效响度（dllmain 采样 audibility 后调 haptic_out_set_level）。
-// 输出端已用独立工具 play34 验证可驱动 DualSense 触觉音圈。
+// 细腻触觉/音频输出：WASAPI 渲染。两种目标：
+//   ① DualSense（>=4 声道）：独占模式、设备真实格式(16-bit)、写 ch3/4 触觉音圈。
+//   ② 虚拟声卡 CABLE（2 声道）：共享模式、float、写两声道 —— 喂给 DSX 的 Audio-to-Haptics。
+// 目标由桌面 haptic_target.txt 决定：内容是端点 ID("{...}.{...}")→按 ID 取；否则当名字子串匹配。
+// 渲染线程通过 haptic_pull_audio() 拉"音效真实波形"。
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmdeviceapi.h>
@@ -18,125 +20,137 @@ static const PROPERTYKEY PK_DevFmt = { {0xf19f064d,0x082c,0x4e27,{0xbc,0x73,0x68
 static const double PI = 3.14159265358979;
 
 static volatile bool g_started = false;
-
-// 可调参数
-static const float HAP_GAIN   = 3.0f;     // 音效波形 → 触觉 增益
-static const float HAP_LP_HZ  = 700.0f;   // 低通截止（聚焦可感受频段、去高频噪声）；0=不低通
+static const float HAP_GAIN  = 3.0f;     // 增益
+static const float HAP_LP_HZ = 700.0f;   // 低通截止；0=不低通
 
 static FILE* g_hlog = nullptr;
 static void hlog(const char* fmt, ...) {
-    if (!g_hlog) return;
-    va_list a; va_start(a, fmt); vfprintf(g_hlog, fmt, a); va_end(a);
+    if (!g_hlog) return; va_list a; va_start(a, fmt); vfprintf(g_hlog, fmt, a); va_end(a);
     fputc('\n', g_hlog); fflush(g_hlog);
 }
 
-// 找激活的、名字含 "DualSense" 的渲染端点
-static IMMDevice* find_dualsense(IMMDeviceEnumerator* en) {
+// 读输出目标配置：默认 "DualSense"
+static void get_target(char* out, int cap) {
+    strncpy_s(out, cap, "DualSense", _TRUNCATE);
+    char path[MAX_PATH]; char* up = nullptr; size_t n = 0;
+    if (_dupenv_s(&up, &n, "USERPROFILE") == 0 && up) {
+        _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\Desktop\\haptic_target.txt", up); free(up);
+        FILE* f = nullptr; fopen_s(&f, path, "r");
+        if (f) { char b[256] = ""; if (fgets(b, sizeof(b), f)) {
+            int s = 0; while (b[s]==' '||b[s]=='\t') s++;
+            int e = (int)strlen(b); while (e>s && (b[e-1]=='\n'||b[e-1]=='\r'||b[e-1]==' '||b[e-1]=='\t')) e--;
+            b[e]=0; if (e>s) strncpy_s(out, cap, b+s, _TRUNCATE); } fclose(f); }
+    }
+}
+
+// 定位目标设备：ID（以 '{' 开头）→GetDevice；否则名字子串→枚举匹配
+static IMMDevice* find_target(IMMDeviceEnumerator* en, bool* outIsCable) {
+    char target[256]; get_target(target, sizeof(target));
+    hlog("target = \"%s\"", target);
+    *outIsCable = (strstr(target, "CABLE") != nullptr) || (strstr(target, "Cable") != nullptr);
+    if (target[0] == '{') {
+        wchar_t id[300]; MultiByteToWideChar(CP_UTF8, 0, target, -1, id, 300);
+        IMMDevice* d = nullptr;
+        if (SUCCEEDED(en->GetDevice(id, &d)) && d) { hlog("GetDevice by ID ok"); return d; }
+        hlog("GetDevice by ID 失败"); return nullptr;
+    }
     IMMDeviceCollection* col = nullptr;
     if (FAILED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &col))) return nullptr;
-    UINT n = 0; col->GetCount(&n);
-    IMMDevice* found = nullptr;
+    UINT n = 0; col->GetCount(&n); IMMDevice* found = nullptr;
     for (UINT i = 0; i < n && !found; ++i) {
         IMMDevice* d = nullptr; col->Item(i, &d);
         IPropertyStore* ps = nullptr; d->OpenPropertyStore(STGM_READ, &ps);
         PROPVARIANT nm; PropVariantInit(&nm); ps->GetValue(PKEY_Device_FriendlyName, &nm);
-        char nb[512] = ""; if (nm.vt == VT_LPWSTR) WideCharToMultiByte(CP_UTF8, 0, nm.pwszVal, -1, nb, sizeof(nb), 0, 0);
-        if (strstr(nb, "DualSense")) { found = d; d->AddRef(); hlog("found endpoint: %s", nb); }
+        char nb[512]=""; if(nm.vt==VT_LPWSTR) WideCharToMultiByte(CP_UTF8,0,nm.pwszVal,-1,nb,sizeof(nb),0,0);
+        if (strstr(nb, target)) { found = d; d->AddRef(); hlog("found: %s", nb); }
         PropVariantClear(&nm); ps->Release(); d->Release();
     }
-    col->Release();
-    return found;
+    col->Release(); return found;
 }
 
 static DWORD WINAPI render_thread(LPVOID) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     IMMDeviceEnumerator* en = nullptr;
-    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                                __uuidof(IMMDeviceEnumerator), (void**)&en))) { hlog("no enumerator"); return 1; }
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en))) return 1;
 
-    // 设备可能稍后才插上：重试找 DualSense
-    IMMDevice* dev = nullptr;
-    for (int tries = 0; tries < 600 && !dev; ++tries) {   // 最多等 ~60s
-        dev = find_dualsense(en);
-        if (!dev) Sleep(100);
-    }
-    if (!dev) { hlog("DualSense 端点未找到（USB 没插？）"); en->Release(); return 1; }
+    IMMDevice* dev = nullptr; bool isCable = false;
+    for (int t = 0; t < 600 && !dev; ++t) { dev = find_target(en, &isCable); if (!dev) Sleep(100); }
+    if (!dev) { hlog("目标设备未找到"); en->Release(); return 1; }
 
     IAudioClient* ac = nullptr;
     if (FAILED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&ac))) { hlog("Activate fail"); return 1; }
+
+    // 读真实格式，判断声道数 → 决定模式
     IPropertyStore* ps = nullptr; dev->OpenPropertyStore(STGM_READ, &ps);
     PROPVARIANT df; PropVariantInit(&df); ps->GetValue(PK_DevFmt, &df);
-    if (!(df.vt == VT_BLOB && df.blob.cbSize >= sizeof(WAVEFORMATEX))) { hlog("no DeviceFormat"); return 1; }
-    WAVEFORMATEX* pfmt = (WAVEFORMATEX*)malloc(df.blob.cbSize);
-    memcpy(pfmt, df.blob.pBlobData, df.blob.cbSize);
-    PropVariantClear(&df); ps->Release();
-    const int CH = pfmt->nChannels, RATE = pfmt->nSamplesPerSec;
-    const int hapL = (CH >= 4) ? 2 : 0, hapR = (CH >= 4) ? 3 : (CH - 1);
-    hlog("fmt ch=%d rate=%d bits=%d", CH, RATE, pfmt->wBitsPerSample);
+    int devCh = 2;
+    if (df.vt==VT_BLOB && df.blob.cbSize>=sizeof(WAVEFORMATEX)) devCh = ((WAVEFORMATEX*)df.blob.pBlobData)->nChannels;
 
-    REFERENCE_TIME defP = 0, minP = 0; ac->GetDevicePeriod(&defP, &minP);
-    REFERENCE_TIME dur = defP;
-    HRESULT hr = ac->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, dur, dur, pfmt, nullptr);
-    if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
-        UINT32 fr = 0; ac->GetBufferSize(&fr);
-        dur = (REFERENCE_TIME)(10000.0 * 1000 / RATE * fr + 0.5);
-        ac->Release(); dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&ac);
+    bool exclusive = (devCh >= 4) && !isCable;   // DualSense 走独占；CABLE 走共享
+    WAVEFORMATEX* pfmt = nullptr;
+    bool isFloat = false;
+    HRESULT hr;
+    REFERENCE_TIME defP=0, minP=0; ac->GetDevicePeriod(&defP,&minP);
+
+    if (exclusive) {
+        pfmt = (WAVEFORMATEX*)malloc(df.blob.cbSize); memcpy(pfmt, df.blob.pBlobData, df.blob.cbSize);
+        REFERENCE_TIME dur = defP;
         hr = ac->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, dur, dur, pfmt, nullptr);
+        if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
+            UINT32 fr=0; ac->GetBufferSize(&fr); dur=(REFERENCE_TIME)(10000.0*1000/pfmt->nSamplesPerSec*fr+0.5);
+            ac->Release(); dev->Activate(__uuidof(IAudioClient),CLSCTX_ALL,nullptr,(void**)&ac);
+            hr = ac->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, dur, dur, pfmt, nullptr);
+        }
+    } else {
+        ac->GetMixFormat(&pfmt);                 // 共享：用混音格式（通常 float 2ch）
+        isFloat = (pfmt->wBitsPerSample == 32);
+        hr = ac->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, pfmt, nullptr);
     }
-    if (FAILED(hr)) { hlog("Initialize fail 0x%08lx", (unsigned long)hr); return 1; }
+    PropVariantClear(&df); ps->Release();
+    if (FAILED(hr)) { hlog("Initialize fail 0x%08lx (exclusive=%d)", (unsigned long)hr, (int)exclusive); return 1; }
 
+    const int CH = pfmt->nChannels, BITS = pfmt->wBitsPerSample;
     HANDLE evt = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     ac->SetEventHandle(evt);
-    UINT32 bufFrames = 0; ac->GetBufferSize(&bufFrames);
-    IAudioRenderClient* rc = nullptr;
-    if (FAILED(ac->GetService(__uuidof(IAudioRenderClient), (void**)&rc))) { hlog("GetService fail"); return 1; }
-
-    DWORD taskIdx = 0; HANDLE mm = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIdx);
-    BYTE* p = nullptr;
-    if (SUCCEEDED(rc->GetBuffer(bufFrames, &p))) rc->ReleaseBuffer(bufFrames, AUDCLNT_BUFFERFLAGS_SILENT);
+    UINT32 bufFrames=0; ac->GetBufferSize(&bufFrames);
+    IAudioRenderClient* rc=nullptr;
+    if (FAILED(ac->GetService(__uuidof(IAudioRenderClient),(void**)&rc))) { hlog("GetService fail"); return 1; }
+    DWORD taskIdx=0; HANDLE mm = AvSetMmThreadCharacteristicsW(L"Pro Audio",&taskIdx);
+    BYTE* p=nullptr; if (SUCCEEDED(rc->GetBuffer(bufFrames,&p))) rc->ReleaseBuffer(bufFrames, AUDCLNT_BUFFERFLAGS_SILENT);
     ac->Start();
-    hlog("started, bufFrames=%u, hapticCh=%d/%d", bufFrames, hapL + 1, hapR + 1);
+    hlog("started: exclusive=%d CH=%d bits=%d float=%d bufFrames=%u", (int)exclusive, CH, BITS, (int)isFloat, bufFrames);
 
-    // 1 极点低通系数
-    float lpK = 1.0f;
-    if (HAP_LP_HZ > 0) lpK = 1.0f - expf(-2.0f * (float)PI * HAP_LP_HZ / RATE);
-    float lp = 0;
-    static float mono[8192];
+    float lpK = (HAP_LP_HZ>0) ? (1.0f - expf(-2.0f*(float)PI*HAP_LP_HZ/pfmt->nSamplesPerSec)) : 1.0f;
+    float lp = 0; static float mono[8192];
 
     while (g_started) {
         if (WaitForSingleObject(evt, 1000) != WAIT_OBJECT_0) continue;
-        UINT32 pad = 0; ac->GetCurrentPadding(&pad);
-        UINT32 avail = bufFrames - pad;
-        if (!avail) continue;
-        if (FAILED(rc->GetBuffer(avail, &p))) break;
-        short* out = (short*)p;
-        int got = haptic_pull_audio(mono, (int)avail);   // 拉音效真实波形
-        for (UINT32 i = 0; i < avail; ++i) {
+        UINT32 pad=0; ac->GetCurrentPadding(&pad);
+        UINT32 avail = bufFrames - pad; if (!avail) continue;
+        if (FAILED(rc->GetBuffer(avail,&p))) break;
+        int got = haptic_pull_audio(mono, (int)avail);
+        for (UINT32 i=0;i<avail;i++) {
             float x = got ? mono[i] : 0.0f;
-            lp += (x - lp) * lpK;                          // 低通
-            float y = lp * HAP_GAIN;
-            if (y > 1) y = 1; if (y < -1) y = -1;
-            short v = (short)(y * 32767.0f);
-            for (int c = 0; c < CH; ++c) out[i * CH + c] = (c == hapL || c == hapR) ? v : 0;
+            lp += (x - lp)*lpK;                          // 低通
+            float y = lp * HAP_GAIN; if (y>1) y=1; if (y<-1) y=-1;
+            for (int c=0;c<CH;c++) {
+                bool hapCh = (CH>=4) ? (c==2||c==3) : true;   // 4声道→ch3/4；否则两声道都写
+                float s = hapCh ? y : 0.0f;
+                if (isFloat) ((float*)p)[i*CH+c] = s;
+                else         ((short*)p)[i*CH+c] = (short)(s*32767.0f);
+            }
         }
         rc->ReleaseBuffer(avail, 0);
     }
-    ac->Stop();
-    if (mm) AvRevertMmThreadCharacteristics(mm);
-    rc->Release(); CloseHandle(evt); ac->Release(); dev->Release(); en->Release();
-    CoUninitialize();
+    ac->Stop(); if (mm) AvRevertMmThreadCharacteristics(mm);
+    rc->Release(); CloseHandle(evt); ac->Release(); dev->Release(); en->Release(); CoUninitialize();
     return 0;
 }
 
 extern "C" void haptic_out_start() {
-    if (g_started) return;
-    g_started = true;
-    char path[MAX_PATH] = "haptic_out_log.txt";
-    char* up = nullptr; size_t n = 0;
-    if (_dupenv_s(&up, &n, "USERPROFILE") == 0 && up) {
-        _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\Desktop\\haptic_out_log.txt", up); free(up);
-    }
-    fopen_s(&g_hlog, path, "w");
-    hlog("=== haptic_out start ===");
+    if (g_started) return; g_started = true;
+    char path[MAX_PATH]="haptic_out_log.txt"; char* up=nullptr; size_t n=0;
+    if (_dupenv_s(&up,&n,"USERPROFILE")==0 && up) { _snprintf_s(path,sizeof(path),_TRUNCATE,"%s\\Desktop\\haptic_out_log.txt",up); free(up); }
+    fopen_s(&g_hlog, path, "w"); hlog("=== haptic_out start ===");
     CreateThread(nullptr, 0, render_thread, nullptr, 0, nullptr);
 }

@@ -191,6 +191,24 @@ static AddDSP_t    g_addDSP    = nullptr;
 static SetCG_t     g_setCG     = nullptr;
 static GetMaster_t g_getMaster = nullptr;
 
+// 声道组枚举（诊断：看游戏 event 系统的总线结构）
+typedef FMOD_RESULT (*CG_NumGroups_t)(void*, int*);
+typedef FMOD_RESULT (*CG_GetGroup_t)(void*, int, void**);
+typedef FMOD_RESULT (*CG_GetName_t)(void*, char*, int);
+typedef FMOD_RESULT (*CG_NumChans_t)(void*, int*);
+static CG_NumGroups_t g_cgNumGroups = nullptr;
+static CG_GetGroup_t  g_cgGetGroup  = nullptr;
+static CG_GetName_t   g_cgGetName   = nullptr;
+static CG_NumChans_t  g_cgNumChans  = nullptr;
+static void enum_groups(void* grp, int depth) {
+    if (!grp || depth > 5) return;
+    char name[256] = ""; if (g_cgGetName) g_cgGetName(grp, name, sizeof(name));
+    int nch = 0; if (g_cgNumChans) g_cgNumChans(grp, &nch);
+    int ng = 0; if (g_cgNumGroups) g_cgNumGroups(grp, &ng);
+    logf("GROUP d=%d \"%s\" channels=%d subgroups=%d", depth, name, nch, ng);
+    for (int i = 0; i < ng; ++i) { void* sub = nullptr; if (g_cgGetGroup && g_cgGetGroup(grp, i, &sub) == 0 && sub) enum_groups(sub, depth + 1); }
+}
+
 // 环形缓冲（单生产者=DSP混音线程，单消费者=WASAPI线程）
 static const unsigned RING = 16384, RMASK = RING - 1;
 static float g_ring[RING];
@@ -261,11 +279,13 @@ static void capture_init() {
     d.version = 1; d.channels = 0; d.read = dsp_read;
     void* dsp = nullptr;
     if (g_createDSP(g_capSystem, &d, &dsp) != 0 || !dsp) { logf("CAP: CreateDSP 失败"); return; }
-    // 测试：把 DSP 挂到 master 主组（全部音频都过它），确认捕获机制是否工作
     void* master = nullptr; void* conn = nullptr;
     if (g_getMaster && g_getMaster(g_capSystem, &master) == 0 && master) {
-        g_addDSP(master, dsp, &conn);
-        logf("CAP: DSP 挂到 MASTER 主组(测试)");
+        logf("=== 声道组结构枚举(诊断) ===");
+        enum_groups(master, 0);                 // 只读：打印 event 系统的总线树
+        logf("=== 枚举结束 ===");
+        g_addDSP(master, dsp, &conn);           // 仍挂 master(临时,让本局有触觉)
+        logf("CAP: DSP 挂到 MASTER 主组");
     } else {
         logf("CAP: 取 master 失败");
     }
@@ -392,6 +412,10 @@ static void do_init() {
     g_addDSP    = (AddDSP_t)    GetProcAddress(g_orig, "FMOD_ChannelGroup_AddDSP");
     g_setCG     = (SetCG_t)     GetProcAddress(g_orig, "FMOD_Channel_SetChannelGroup");
     g_getMaster = (GetMaster_t) GetProcAddress(g_orig, "FMOD_System_GetMasterChannelGroup");
+    g_cgNumGroups = (CG_NumGroups_t) GetProcAddress(g_orig, "FMOD_ChannelGroup_GetNumGroups");
+    g_cgGetGroup  = (CG_GetGroup_t)  GetProcAddress(g_orig, "FMOD_ChannelGroup_GetGroup");
+    g_cgGetName   = (CG_GetName_t)   GetProcAddress(g_orig, "FMOD_ChannelGroup_GetName");
+    g_cgNumChans  = (CG_NumChans_t)  GetProcAddress(g_orig, "FMOD_ChannelGroup_GetNumChannels");
 
     // 填全部 jmp 桩的目标（按序号从原 dll 取）
     int thunkNull = 0;
