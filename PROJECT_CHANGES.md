@@ -561,12 +561,34 @@ FMOD 探针(已有) → 捕获"只含音效"的 PCM → WASAPI 写入 DualSense 
 - `src/native/haptic_test/getdev.cpp`：按端点 ID 取设备、读格式的小工具（VB-CABLE 用 GetDevice-by-ID 才能打开）。
 - VB-CABLE 踩坑：装出了重复实例(其一 problemCode 10)，`EnumAudioEndpoints` 列不出 CABLE，但 `GetDevice(端点ID)` 能打开（CABLE Input=2ch/48k/24bit 独占、共享 float）。
 
+## 🔬 枚举结果（6-24 实跑）：❌ 没有"音效组"——"找音效组去 tap"被证伪
+master 下的真实结构：
+```
+master group       channels=400  subgroups=2   ← 400 条通道全平铺在这一层
+├─ _master_dummy_              channels=0   (空)
+└─ m000000001_..._DummyGroup   channels=0   (空)
+```
+**所有 400 条通道(音效+音乐+语音)平铺在 master，两个子组都是空壳。** FMOD Event 系统**没有**按类别分底层声道组。
+→ 上一节设想的"tap 音效组"**不存在该组**，作废。
+
+## ✅ 修正后的正路：旁链(side-chain) DSP tap 逐音效通道（函数已确认全导出）
+既然只有平铺通道、且我们已知哪条是音效，就**逐音效通道旁链 tap**（不同于上次崩的"插入 DSP"）：
+1. 建捕获 DSP，`FMOD_DSP_AddInput(masterHead, captureDsp)` 接成 master 的**静音输入**（被处理、输出静音、不改游戏音频）。
+   masterHead 由 `FMOD_ChannelGroup_GetDSPHead(master)` 拿。
+2. 判定 VIBRATE 时：`FMOD_DSP_AddInput(captureDsp, FMOD_Channel_GetDSPHead(channel))` —— 把该音效通道**作为输入**接给 captureDsp
+   （通道照常流向 master，额外复制一份给 captureDsp）。
+3. FMOD 自动把 captureDsp 的多个音效输入**混好**再调 read 回调 → 拿到**只含音效**的连续 PCM → 环 → 输出。
+   read 回调务必**输出静音**(不能透传，否则音效会在 master 里被加倍)。
+4. 清理：通道停时连接应由 FMOD 随通道 head 释放而清除；必要时用 `FMOD_DSP_DisconnectFrom` 主动断。
+- 已确认导出：`ChannelGroup_GetDSPHead`/`Channel_GetDSPHead`/`DSP_AddInput`/`DSP_DisconnectFrom`/`DSP_Remove`/`DSP_SetActive`。
+- ⚠️ 风险：DSP 图操作易崩(同前)、stale 连接累积；先小心实现 + 诊断 DSP peak。
+
 ## ⏭️ 下一步
-- [ ] 实跑枚举诊断，看 master 子组结构，定位"音效组"（可能名字含 se/sfx/main 等）。
-- [ ] 把捕获 DSP 挂到那个音效组 → 干净的只含音效 PCM → 虚拟声卡 → DSX（或直驱 ch3/4）。
-- [ ] 若 event 类别组在低层不可见，则考虑借 `fmod_event64` 的 EventCategory API 拿组。
+- [ ] 实现旁链 tap，验证 captureDsp 拿到的是否**只含音效**(DSP peak>0、且静听 BGM 时为 0)。
+- [ ] 干净 SFX PCM → 虚拟声卡 → DSX（手感惊艳那条），或直驱 ch3/4。
+- [ ] 注意连接清理，避免长时间累积导致卡顿/崩。
 
 ---
 
 **记录时间**: 2026-06-24  
-**当前阶段**: 🔄 DSX 手感惊艳但需"只抓音效" → 已定位正路(tap event 音效组)，待枚举验证
+**当前阶段**: 🔄 数据证伪"音效组" → 修正正路=旁链 tap 逐音效通道(函数齐备)，待实现验证
