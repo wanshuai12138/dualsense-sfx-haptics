@@ -59,7 +59,8 @@ static playSound_t                g_playSound    = nullptr;
 static Sound_GetName_t            g_getName      = nullptr;
 static Sound_GetSubSoundParent_t g_getParent    = nullptr;
 static Sound_GetNumSubSounds_t   g_getNumSub    = nullptr;
-static Sound_GetSubSound_t       g_getSub       = nullptr;
+static Sound_GetSubSound_t       g_getSub       = nullptr;   // 真 C  FMOD_Sound_GetSubSound
+static Sound_GetSubSound_t       g_getSubCpp    = nullptr;   // 真 C++ Sound::getSubSound
 
 static HMODULE g_orig = nullptr;
 
@@ -72,8 +73,28 @@ extern "C" void* g_thunk_targets[THUNK_COUNT] = { nullptr };
 
 // Sound* -> 来源 bank 文件名（basename）
 static std::unordered_map<void*, std::string> g_soundBank;
+// 子声音指针 -> 它在 bank 里的 index（hook getSubSound 时记录，用于在 playSound 认出"是第几号音效"）
+static std::unordered_map<void*, int> g_subIndex;
 static std::mutex g_lock;
 static FILE* g_log = nullptr;
+
+// 子声音 index → 含义（自测 + 研究资料，对本版 smain 系 bank 有效）
+static const char* sound_meaning(int idx) {
+    if (idx >= 665 && idx <= 700) return "弹刀/格挡/clash";   // 自测：681/682=弹刀，整簇为弹刀格挡变体
+    if (idx == 408)               return "危攻蓄力";           // 实测确认
+    if (idx >= 983 && idx <= 992) return "受伤/死亡";          // 实测确认
+    if (idx >= 401 && idx <= 402) return "水月反击";           // 研究资料(待实测)
+    return "?";
+}
+
+// 是否是"该触发触觉"的战斗事件（白名单）。环境音/脚步等不在内 → 不震，避免音乐漏入。
+static bool is_haptic_event(int idx) {
+    if (idx < 0) return false;
+    if (idx >= 665 && idx <= 700) return true;   // 弹刀/格挡
+    if (idx == 408)               return true;   // 危攻
+    if (idx >= 983 && idx <= 992) return true;   // 受伤/死亡
+    return false;
+}
 
 // ----------------------------------------------------------------------------
 static const char* basename_ascii(const char* path) {
@@ -351,6 +372,21 @@ extern "C" FMOD_RESULT createSoundInternal_detour(void* self, const char* nameOr
     return r;
 }
 
+// 拦截 getSubSound（C++ 与 C 两个入口）：只读记录 子声音指针 → index，
+// 这样 playSound(子声音) 时能反查出"这是 bank 里第几号"，从而识别弹刀/受击/脚步等。
+extern "C" FMOD_RESULT getSubSoundCpp_detour(void* self, int index, void** subsound) {
+    ensure_init();
+    FMOD_RESULT r = g_getSubCpp ? g_getSubCpp(self, index, subsound) : -1;
+    if (r == 0 && subsound && *subsound) { std::lock_guard<std::mutex> g(g_lock); g_subIndex[*subsound] = index; }
+    return r;
+}
+extern "C" FMOD_RESULT getSubSoundC_detour(void* self, int index, void** subsound) {
+    ensure_init();
+    FMOD_RESULT r = g_getSub ? g_getSub(self, index, subsound) : -1;
+    if (r == 0 && subsound && *subsound) { std::lock_guard<std::mutex> g(g_lock); g_subIndex[*subsound] = index; }
+    return r;
+}
+
 extern "C" FMOD_RESULT playSound_detour(void* self, int channelid, void* sound, int paused, void** channel) {
     ensure_init();
     FMOD_RESULT r = g_playSound(self, channelid, sound, paused, channel);
@@ -369,12 +405,16 @@ extern "C" FMOD_RESULT playSound_detour(void* self, int channelid, void* sound, 
     if (bank == "(null)")           verdict = "?";
     else if (bank == "(unknown)")   verdict = "VIBRATE(sfx-sub)";
     else                            verdict = classify(bank);
-    logf("PLAY  ch=%d sound=%p bank=%s sub=\"%s\" -> %s",
-         channelid, sound, bank.c_str(), subname, verdict);
-    if (verdict[0] == 'V') {            // VIBRATE → 开门，让 master 音频在此刻透到触觉
+    // 反查子声音 index（getSubSound hook 记录的）
+    int subIdx = -1;
+    { std::lock_guard<std::mutex> g(g_lock); auto it = g_subIndex.find(sound); if (it != g_subIndex.end()) subIdx = it->second; }
+    logf("PLAY  ch=%d sound=%p bank=%s sub=\"%s\" -> %s  idx=%d (%s)",
+         channelid, sound, bank.c_str(), subname, verdict, subIdx, subIdx >= 0 ? sound_meaning(subIdx) : "-");
+    if (verdict[0] == 'V') {            // VIBRATE
         ensure_haptic();
         ensure_capture(self);
-        g_gate.store(1.0f, std::memory_order_relaxed);
+        if (is_haptic_event(subIdx))   // 仅在识别出的战斗事件开门 → 喂那一瞬真实音频
+            g_gate.store(1.0f, std::memory_order_relaxed);
     }
     if (bank == "(unknown)") diagnose_unknown(sound);  // 仍只读记录少量样本，便于复核
     return r;
@@ -406,6 +446,7 @@ static void do_init() {
     g_getParent    = (Sound_GetSubSoundParent_t)  GetProcAddress(g_orig, "FMOD_Sound_GetSubSoundParent");
     g_getNumSub    = (Sound_GetNumSubSounds_t)    GetProcAddress(g_orig, "FMOD_Sound_GetNumSubSounds");
     g_getSub       = (Sound_GetSubSound_t)        GetProcAddress(g_orig, "FMOD_Sound_GetSubSound");
+    g_getSubCpp    = (Sound_GetSubSound_t)        GetProcAddress(g_orig, "?getSubSound@Sound@FMOD@@QEAA?AW4FMOD_RESULT@@HPEAPEAV12@@Z");
     // 震动用：声道组 + 捕获 DSP
     g_createCG  = (CreateCG_t)  GetProcAddress(g_orig, "FMOD_System_CreateChannelGroup");
     g_createDSP = (CreateDSP_t) GetProcAddress(g_orig, "FMOD_System_CreateDSP");

@@ -190,7 +190,7 @@ EXPORTS
     ?getSpectrum@ChannelGroup@FMOD@@QEAA?AW4FMOD_RESULT@@PEAMHHW4FMOD_DSP_FFT_WINDOW@@@Z=thunk_185 @188
     ?getSpectrum@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEAMHHW4FMOD_DSP_FFT_WINDOW@@@Z=thunk_186 @189
     ?getStreamBufferSize@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEAI0@Z=thunk_187 @190
-    ?getSubSound@Sound@FMOD@@QEAA?AW4FMOD_RESULT@@HPEAPEAV12@@Z=thunk_188 @191
+    ?getSubSound@Sound@FMOD@@QEAA?AW4FMOD_RESULT@@HPEAPEAV12@@Z=getSubSoundCpp_detour @191
     ?getSubSoundParent@Sound@FMOD@@QEAA?AW4FMOD_RESULT@@PEAPEAV12@@Z=thunk_189 @192
     ?getSyncPoint@Sound@FMOD@@QEAA?AW4FMOD_RESULT@@HPEAPEAUFMOD_SYNCPOINT@@@Z=thunk_190 @193
     ?getSyncPointInfo@Sound@FMOD@@QEAA?AW4FMOD_RESULT@@PEAUFMOD_SYNCPOINT@@PEADHPEAII@Z=thunk_191 @194
@@ -582,7 +582,7 @@ EXPORTS
     FMOD_Sound_GetNumTags=thunk_576 @580
     FMOD_Sound_GetOpenState=thunk_577 @581
     FMOD_Sound_GetSoundGroup=thunk_578 @582
-    FMOD_Sound_GetSubSound=thunk_579 @583
+    FMOD_Sound_GetSubSound=getSubSoundC_detour @583
     FMOD_Sound_GetSubSoundParent=thunk_580 @584
     FMOD_Sound_GetSyncPoint=thunk_581 @585
     FMOD_Sound_GetSyncPointInfo=thunk_582 @586
