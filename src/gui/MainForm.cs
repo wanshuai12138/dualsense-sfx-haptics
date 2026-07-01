@@ -2,6 +2,8 @@ using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.IO.Compression;
+using System.Net.Http;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -24,6 +26,7 @@ public class MainForm : Form
     Label lblStProxy = null!, lblStGame = null!, lblStPad = null!, lblStCable = null!;
     Button btnInstall = null!, btnUninstall = null!;
     RadioButton rbDirect = null!, rbCable = null!;
+    Button btnInstallCable = null!;
     Label lblMsg = null!;
     System.Windows.Forms.Timer statusTimer = null!;
 
@@ -46,7 +49,7 @@ public class MainForm : Form
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(500, 590);
+        ClientSize = new Size(500, 632);
 
         BuildUi();
 
@@ -115,21 +118,24 @@ public class MainForm : Form
         y += 54;
 
         // ---- 输出 ----
-        var op = MakePanel("触觉输出", x, y, w, 96);
+        var op = MakePanel("触觉输出", x, y, w, 128);
         Controls.Add(op);
-        rbDirect = new RadioButton {
-            Text = "DualSense 手柄 ch3/4 直驱（推荐，无需额外软件）",
-            Location = new Point(14, 28), Size = new Size(op.Width - 28, 24), ForeColor = FG
-        };
-        rbDirect.CheckedChanged += (s, e) => OnOutputChanged();
-        op.Controls.Add(rbDirect);
         rbCable = new RadioButton {
-            Text = "虚拟声卡 → DSX（需已安装 VB-CABLE）",
-            Location = new Point(14, 56), Size = new Size(op.Width - 28, 24), ForeColor = FG
+            Text = "虚拟声卡 → DSX   ⭐ 推荐·手感最佳（需 VB-CABLE + DSX）",
+            Location = new Point(14, 28), Size = new Size(op.Width - 28, 24), ForeColor = FG
         };
         rbCable.CheckedChanged += (s, e) => OnOutputChanged();
         op.Controls.Add(rbCable);
-        y += 108;
+        rbDirect = new RadioButton {
+            Text = "DualSense ch3/4 直驱（省事，但弹刀等高频音较弱）",
+            Location = new Point(14, 56), Size = new Size(op.Width - 28, 24), ForeColor = FG
+        };
+        rbDirect.CheckedChanged += (s, e) => OnOutputChanged();
+        op.Controls.Add(rbDirect);
+        btnInstallCable = MakeButton("↓ 一键下载安装 VB-CABLE（免费虚拟声卡）", 14, 90, op.Width - 28, 28, accent: true);
+        btnInstallCable.Click += async (s, e) => await InstallCable();
+        op.Controls.Add(btnInstallCable);
+        y += 140;
 
         // ---- 消息 ----
         lblMsg = new Label {
@@ -196,6 +202,12 @@ public class MainForm : Form
         btnUninstall.Enabled = installed && !gameRunning;
         rbCable.Enabled = dev.cable;
         if (!dev.cable && rbCable.Checked) { _loading = true; rbDirect.Checked = true; _loading = false; }
+        if (dev.cable) { btnInstallCable.Text = "✓ VB-CABLE 已安装"; btnInstallCable.Enabled = false; }
+        else if (btnInstallCable.Enabled == false && btnInstallCable.Text.StartsWith("✓")) { } // 安装中不覆盖
+        else { btnInstallCable.Text = "↓ 一键下载安装 VB-CABLE（免费虚拟声卡）"; btnInstallCable.Enabled = true; }
+
+        // 新用户(还没设过输出)且检测到 CABLE → 默认走推荐的 DSX 路线，一上手就是最佳手感
+        if (dev.cable && !rbCable.Checked && !File.Exists(TargetFile)) rbCable.Checked = true;
 
         if (!proxyBundled) Msg("⚠ 找不到打包的代理 DLL（proxy\\fmodex64.dll）。请先编译 fmod_probe。", BAD);
         else if (gameRunning && !installed) Msg("只狼运行中，安装/卸载需先关闭游戏。", MUTE);
@@ -304,6 +316,43 @@ public class MainForm : Form
             if (name.IndexOf("CABLE Input", StringComparison.OrdinalIgnoreCase) >= 0) { cable = true; cableId = d.ID; }
         }
         return (pad, cable, cableId);
+    }
+
+    // ============================ 一键安装 VB-CABLE(官方下载,不打包) ============================
+    async System.Threading.Tasks.Task InstallCable()
+    {
+        const string page = "https://vb-audio.com/Cable/";
+        const string url = "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip";
+        if (MessageBox.Show(
+                "将从 VB-Audio 官方下载 VB-CABLE 虚拟声卡安装器并打开。\n\n" +
+                "· VB-CABLE 免费；「虚拟声卡→DSX」手感路线需要它\n" +
+                "· 安装需管理员权限，装完请【重启电脑】\n\n是否继续？",
+                "下载安装 VB-CABLE", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        btnInstallCable.Enabled = false;
+        try
+        {
+            Msg("正在从 VB-Audio 官方下载…", MUTE);
+            string dir = Path.Combine(Path.GetTempPath(), "VBCABLE_dl");
+            Directory.CreateDirectory(dir);
+            string zip = Path.Combine(dir, "VBCABLE.zip");
+            using (var http = new HttpClient { Timeout = TimeSpan.FromMinutes(3) })
+                await File.WriteAllBytesAsync(zip, await http.GetByteArrayAsync(url));
+            string ex = Path.Combine(dir, "extracted");
+            if (Directory.Exists(ex)) Directory.Delete(ex, true);
+            ZipFile.ExtractToDirectory(zip, ex);
+            string? setup = Directory.GetFiles(ex, "VBCABLE_Setup_x64.exe", SearchOption.AllDirectories).FirstOrDefault()
+                         ?? Directory.GetFiles(ex, "VBCABLE_Setup*.exe", SearchOption.AllDirectories).FirstOrDefault();
+            if (setup == null) throw new FileNotFoundException("压缩包里没找到安装器");
+            Msg("✓ 已下载。在弹出的安装器里点 Install Driver，装完请【重启电脑】。", OK);
+            try { Process.Start(new ProcessStartInfo(setup) { UseShellExecute = true, Verb = "runas" }); }
+            catch { Msg("安装器已下载到：" + setup + "，请手动以管理员运行。", MUTE); }
+        }
+        catch (Exception ex)
+        {
+            Msg("自动下载失败（" + ex.Message + "），已打开官方页，请手动下载安装。", BAD);
+            try { Process.Start(new ProcessStartInfo(page) { UseShellExecute = true }); } catch { }
+        }
+        finally { btnInstallCable.Enabled = true; }
     }
 
     // ============================ 游戏路径 ============================
