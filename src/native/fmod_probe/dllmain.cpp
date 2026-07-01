@@ -30,6 +30,7 @@
 #include <mutex>
 #include <atomic>
 #include <cstdarg>
+#include <share.h>   // _fsopen / _SH_DENYWR：日志用共享读打开，游戏运行时外部也能读
 
 // --- FMOD 不透明类型，避免引入 FMOD 头文件 ---
 typedef int FMOD_RESULT;                 // 0 == FMOD_OK
@@ -83,6 +84,17 @@ static const char* sound_meaning(int idx) {
     if (idx >= 665 && idx <= 700) return "弹刀/格挡/clash";   // 自测：681/682=弹刀，整簇为弹刀格挡变体
     if (idx == 408)               return "危攻蓄力";           // 实测确认
     if (idx >= 983 && idx <= 992) return "受伤/死亡";          // 实测确认
+    if (idx >= 851 && idx <= 853) return "处决/破防duang";     // 自测：853每次处决刷一次(3处决→3,2处决→2)
+    if (idx >= 256 && idx <= 258) return "布料/剧烈移动(闪避)"; // 自测:只在闪避/挥刀/战斗响,轻走路不响(走路0次,闪避10次)→闪避靠它
+    if (idx == 428 || idx == 435 || idx == 438 || idx == 444 || idx == 456) return "UI/菜单音"; // 自测:标题/佛雕菜单导航
+    if (idx == 353 || idx == 354) return "濒死心跳";          // 自测:濒死状态扑通两下反复
+    if (idx >= 33  && idx <= 35)  return "归佛/传送";          // 自测:佛雕点传送(smain_jaj)
+    if (idx >= 57  && idx <= 59)  return "死字咚/死亡屏幕";    // 自测:死亡时(smain_jaj)
+    if (idx == 1031|| idx == 1032) return "地名咚/到达";       // 自测:到新地点
+    if (idx >= 60  && idx <= 64)  return "脚步(通用)";         // 自测:所有地面每步都刷(太频繁,不收)
+    if (idx >= 579 && idx <= 582) return "木质脚步";           // 自测:木板脚步(曾误认为闪避)
+    if (idx >= 629 && idx <= 632) return "雪地脚步";           // 自测:雪地脚步
+    if (idx == 330 || idx == 331 || idx == 641) return "不死斩挥刀"; // 自测：每挥一次刷一次
     if (idx >= 401 && idx <= 402) return "水月反击";           // 研究资料(待实测)
     return "?";
 }
@@ -93,6 +105,17 @@ static bool is_haptic_event(int idx) {
     if (idx >= 665 && idx <= 700) return true;   // 弹刀/格挡
     if (idx == 408)               return true;   // 危攻
     if (idx >= 983 && idx <= 992) return true;   // 受伤/死亡
+    if (idx >= 851 && idx <= 853) return true;   // 处决/破防 duang
+    if (idx >= 256 && idx <= 258) return true;   // 布料/剧烈移动=闪避信号(轻走路不响,只在闪避/挥刀/战斗响)
+    if (idx == 330 || idx == 331 || idx == 641) return true;  // 不死斩挥刀
+    // 新增 UI/系统事件(均实测游戏内几乎不出现,误触发0-2次):
+    if (idx == 428 || idx == 435 || idx == 438 || idx == 444 || idx == 456) return true; // 菜单/标题/选项 UI 音
+    if (idx == 353 || idx == 354) return true;   // 濒死心跳(扑通两下=353+354一对反复)
+    if (idx >= 33 && idx <= 35)   return true;   // 归佛/佛雕点传送 stinger
+    if (idx >= 57 && idx <= 59)   return true;   // "死"字屏幕咚/死亡 stinger
+    if (idx == 1031 || idx == 1032) return true; // 到新地点·地名"咚"/到达
+    // 注意：故意不收 60-64(通用脚步,走哪震哪太乱)、579-582/629-632(地面脚步)、174/1305/1306(不死斩血焰循环音)、
+    //       xm11.fsb idx=0(区域环境音,一直响)、smain_jaj idx=7(该bank也含游戏内声音,故按具体idx收而非整bank)
     return false;
 }
 
@@ -284,7 +307,8 @@ extern "C" int haptic_pull_audio(float* out, int n) {
     // 诊断：每约 300 次（~3s）报一次消费端
     static std::atomic<int> pc{0}; static float pmax = 0; static unsigned amax = 0;
     if (peak > pmax) pmax = peak; if (avail > amax) amax = avail;
-    if (pc.fetch_add(1) % 300 == 299) { logf("PULL peak=%.4f availMax=%u", pmax, amax); pmax = 0; amax = 0; }
+    // PULL 刷屏日志已关闭(每帧写会独占锁死文件+刷爆日志)。需要诊断时再开。
+    (void)pc; (void)pmax; (void)amax;
     return (got && peak >= 0.004f) ? 1 : 0;
 }
 
@@ -433,7 +457,7 @@ static void do_init() {
         free(up);
     }
     g_log = nullptr;
-    fopen_s(&g_log, path, "w");
+    g_log = _fsopen(path, "w", _SH_DENYWR);   // 共享读：DLL 写时外部进程仍可读日志(否则被独占锁死)
 
     g_orig = LoadLibraryA("fmodex64_orig.dll");
     if (!g_orig) { logf("FATAL: cannot load fmodex64_orig.dll (err=%lu)", GetLastError()); return; }
