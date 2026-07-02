@@ -149,8 +149,8 @@ static DWORD WINAPI render_thread(LPVOID) {
 
 extern "C" void haptic_out_start() {
     if (g_started) return; g_started = true;
-    char path[MAX_PATH]="haptic_out_log.txt"; char* up=nullptr; size_t n=0;
-    if (_dupenv_s(&up,&n,"USERPROFILE")==0 && up) { _snprintf_s(path,sizeof(path),_TRUNCATE,"%s\\Desktop\\haptic_out_log.txt",up); free(up); }
+    char path[MAX_PATH]="haptic_out_log.txt"; char* up=nullptr; size_t n=0;   // 调试日志放 %TEMP%，不脏桌面
+    if (_dupenv_s(&up,&n,"TEMP")==0 && up) { _snprintf_s(path,sizeof(path),_TRUNCATE,"%s\\haptic_out_log.txt",up); free(up); }
     fopen_s(&g_hlog, path, "w"); hlog("=== haptic_out start ===");
     CreateThread(nullptr, 0, render_thread, nullptr, 0, nullptr);
 }

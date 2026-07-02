@@ -292,7 +292,11 @@ extern "C" int haptic_pull_audio(float* out, int n) {
     unsigned wr = g_wr.load(std::memory_order_acquire);
     unsigned rd = g_rd.load(std::memory_order_relaxed);
     unsigned avail = wr - rd;
-    if (avail > (unsigned)n + RING / 2) rd = wr - n;   // 落后太多→跳近，限延迟
+    // 只保留 ~3 个 WASAPI 帧的 backlog：把延迟从 ~170ms(RING/2) 砍到 ~20-30ms，
+    // 并让"门"对齐到实时音频(否则门乘的是170ms前的旧音频、弹刀真音到时门已衰减)。
+    // 太小会欠载爆音/断音；触觉对 glitch 较宽容，可从此值(3)往下调。
+    unsigned target = 3u * (unsigned)n;
+    if (avail > target) rd = wr - target;
     float gate = g_gate.load(std::memory_order_relaxed);
     int got = 0; float peak = 0;
     for (int i = 0; i < n; ++i) {
@@ -449,11 +453,11 @@ extern "C" FMOD_RESULT playSound_detour(void* self, int channelid, void* sound, 
 // 的 jmp 桩透明转交，无需在此手写包装函数。do_init() 负责把 g_thunk_targets 填好。
 // ----------------------------------------------------------------------------
 static void do_init() {
-    // 日志文件：桌面
+    // 日志文件：%TEMP%（调试日志，不脏用户桌面）
     char path[MAX_PATH] = "fmod_probe_log.txt";
     char* up = nullptr; size_t n = 0;
-    if (_dupenv_s(&up, &n, "USERPROFILE") == 0 && up) {
-        _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\Desktop\\fmod_probe_log.txt", up);
+    if (_dupenv_s(&up, &n, "TEMP") == 0 && up) {
+        _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\fmod_probe_log.txt", up);
         free(up);
     }
     g_log = nullptr;

@@ -54,13 +54,13 @@
 #### 先搞懂音频怎么流转（理解了就不会配错）
 
 ```
- 只狼的音效 ──本工具抓取──▶  CABLE Input  ══虚拟线══▶  CABLE Output ──▶  DSX ──▶ 手柄触觉
-（音乐/语音不抓）            (虚拟声卡·播放端)          (虚拟声卡·录音端)      转触觉
+ 只狼的音效 ──本工具抓取──▶  CABLE Input  ──DSX 从这里监听──▶  DSX ──▶ 手柄触觉
+（音乐/语音不抓）            (虚拟声卡·播放端)                    转触觉
 ```
 
-- **VB-CABLE 是一根"虚拟音频线"**：装好后系统里会出现**一对**设备——
-  **CABLE Input**（播放端）和 **CABLE Output**（录音端）。送进 Input 的声音，会原样从 Output 出来。
-- 本工具把**抓到的音效**送进 **CABLE Input**；**DSX 从 CABLE Output 听**，转成手柄触觉。
+- **VB-CABLE 是一根"虚拟音频线"**：装好后系统里会出现一对设备——**CABLE Input**（播放端）和 **CABLE Output**（录音端）。
+- 本工具把**抓到的音效**送进 **CABLE Input**；**DSX 直接监听 CABLE Input**（loopback 抓取这个播放端的声音），转成手柄触觉。
+  （所以我们用到的是 **CABLE Input** 这一端；CABLE Output 用不到。）
 - ✅ **游戏正常声音不受影响**：本工具是**单独复制一份音效**送去虚拟声卡，你的**喇叭/耳机照常出声**，
   **不需要改 Windows 默认播放设备**。
 
@@ -83,17 +83,18 @@
 
 **⑤ 配置 DSX 的音频来源（关键！最容易选错的一步）**
 1. 打开 DSX，找到 **Audio to Haptics**（音频→触觉）功能，**开启**。
-2. 把它的**音频输入/监听设备**选成 👉 **`CABLE Output (VB-Audio Virtual Cable)`**
-   —— 就是那个带 **CABLE** 字样的虚拟声卡，选**录音端 Output** 的那个（不是你的喇叭、不是"默认设备"）。
+2. 把它的**音频输入/监听设备**选成 👉 **`CABLE Input (VB-Audio Virtual Cable)`**
+   —— 就是那个带 **CABLE** 字样的虚拟声卡（本工具把音效送进这里、DSX 从这里 loopback 监听）；不是你的喇叭、不是"默认设备"。
+   > 若你的 DSX 版本里选 Input 没反应，再试 **CABLE Output**；核心是选那个带 **CABLE** 字样的虚拟声卡。
 3. （可选）在 DSX 里把强度、低通调到你喜欢的手感。
 
 **⑥ 开玩** —— **USB** 接 DualSense → Steam 给只狼开 **Steam Input** → 启动游戏 →
 战斗时手柄就有**只含音效**的细腻触觉了 🎉
 
 > ⚠️ **常见坑**
-> - **DSX 里设备选错**（选成喇叭/默认设备）→ 会把**所有声音**都转触觉，音乐也震 → **必须选 CABLE Output**。
+> - **DSX 里设备选错**（选成喇叭/默认设备）→ 会把**所有声音**都转触觉，音乐也震 → **必须选带 CABLE 字样的虚拟声卡（先试 CABLE Input）**。
 > - **别**把 CABLE 设成 Windows 默认播放设备（那样游戏声音会跑进虚拟线、喇叭反而没声）。本工具已单独送 CABLE，无需这么做。
-> - **不震/没声**：确认 VB-CABLE 已装且**重启过**、本工具输出是「虚拟声卡→DSX」、DSX 的 Audio to Haptics 已开且选了 CABLE Output。
+> - **不震/没声**：确认 VB-CABLE 已装且**重启过**、本工具输出是「虚拟声卡→DSX」、DSX 的 Audio to Haptics 已开且选了 CABLE Input。
 
 ---
 
