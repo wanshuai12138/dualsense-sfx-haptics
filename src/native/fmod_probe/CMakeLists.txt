@@ -20,6 +20,10 @@ target_link_options(fmodex64 PRIVATE
 
 set_property(TARGET fmodex64 PROPERTY CXX_STANDARD 17)
 
+if (MSVC)
+    target_compile_options(fmodex64 PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+endif()
+
 # 构建示例：
 #   cmake -B build -A x64
 #   cmake --build build --config Release

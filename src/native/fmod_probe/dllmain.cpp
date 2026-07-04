@@ -30,6 +30,8 @@
 #include <mutex>
 #include <atomic>
 #include <cstdarg>
+#include <cmath>
+#include <cstdlib>
 #include <share.h>   // _fsopen / _SH_DENYWR：日志用共享读打开，游戏运行时外部也能读
 
 // --- FMOD 不透明类型，避免引入 FMOD 头文件 ---
@@ -49,8 +51,8 @@ typedef FMOD_RESULT (*createSoundInternal_t)(void* self, const char* nameOrData,
 
 // 辅助 C API（用扁平 C 导出，调用最省事）
 typedef FMOD_RESULT (*Sound_GetName_t)(void* sound, char* name, int namelen);
-typedef FMOD_RESULT (*Sound_GetSubSoundParent_t)(void* sound, void** parent);
-typedef FMOD_RESULT (*Sound_GetNumSubSounds_t)(void* sound, int* numsubsounds);
+typedef FMOD_RESULT (*SoundGetParent_t)(void* sound, void** parent);
+typedef FMOD_RESULT (*SoundGetNumSub_t)(void* sound, int* numsubsounds);
 typedef FMOD_RESULT (*Sound_GetSubSound_t)(void* sound, int index, void** subsound);
 
 static createSound_t              g_createSound  = nullptr;
@@ -58,8 +60,8 @@ static createStream_t             g_createStream = nullptr;
 static createSoundInternal_t      g_createSoundInternal = nullptr;
 static playSound_t                g_playSound    = nullptr;
 static Sound_GetName_t            g_getName      = nullptr;
-static Sound_GetSubSoundParent_t g_getParent    = nullptr;
-static Sound_GetNumSubSounds_t   g_getNumSub    = nullptr;
+static SoundGetParent_t           g_getParent    = nullptr;
+static SoundGetNumSub_t           g_getNumSub    = nullptr;
 static Sound_GetSubSound_t       g_getSub       = nullptr;   // 真 C  FMOD_Sound_GetSubSound
 static Sound_GetSubSound_t       g_getSubCpp    = nullptr;   // 真 C++ Sound::getSubSound
 
@@ -76,6 +78,7 @@ extern "C" void* g_thunk_targets[THUNK_COUNT] = { nullptr };
 static std::unordered_map<void*, std::string> g_soundBank;
 // 子声音指针 -> 它在 bank 里的 index（hook getSubSound 时记录，用于在 playSound 认出"是第几号音效"）
 static std::unordered_map<void*, int> g_subIndex;
+static std::unordered_map<void*, std::string> g_subBank;
 static std::mutex g_lock;
 static FILE* g_log = nullptr;
 
@@ -99,9 +102,30 @@ static const char* sound_meaning(int idx) {
     return "?";
 }
 
-// 是否是"该触发触觉"的战斗事件（白名单）。环境音/脚步等不在内 → 不震，避免音乐漏入。
+static const char* sound_group_key(int idx) {
+    if (idx >= 665 && idx <= 700) return "deflect_guard";
+    if (idx == 408)               return "danger_attack";
+    if (idx >= 983 && idx <= 992) return "hurt_death";
+    if (idx >= 851 && idx <= 853) return "deathblow_break";
+    if (idx >= 256 && idx <= 258) return "dodge_cloth";
+    if (idx == 330 || idx == 331 || idx == 641) return "mortal_draw";
+    if (idx == 428 || idx == 435 || idx == 438 || idx == 444 || idx == 456) return "ui_menu";
+    if (idx == 353 || idx == 354) return "low_hp_heartbeat";
+    if (idx >= 33  && idx <= 35)  return "travel_buddha";
+    if (idx >= 57  && idx <= 59)  return "death_screen";
+    if (idx == 1031 || idx == 1032) return "area_title";
+    if (idx >= 60  && idx <= 64)  return "footstep_common";
+    if (idx >= 579 && idx <= 582) return "footstep_wood";
+    if (idx >= 629 && idx <= 632) return "footstep_snow";
+    if (idx >= 401 && idx <= 402) return "ashina_cross_counter";
+    return nullptr;
+}
+
+// 旧版白名单：保留这些含义映射给 GUI/日志参考。
+// 当前默认策略已经收敛为 bank 级：只排除 vm*(语音) 和 sm##(音乐)，其余 SFX 默认震动。
 static bool is_haptic_event(int idx) {
     if (idx < 0) return false;
+    if (idx == 1131 || idx == 1132) return false; // 手感差，显式排除
     if (idx >= 665 && idx <= 700) return true;   // 弹刀/格挡
     if (idx == 408)               return true;   // 危攻
     if (idx >= 983 && idx <= 992) return true;   // 受伤/死亡
@@ -128,7 +152,7 @@ static const char* basename_ascii(const char* path) {
     return b;
 }
 
-// 按文件名分类：music = sm + 数字, voice = vm*, 其余 = 震动
+// 按文件名分类：music = sm + 数字, voice = vm*, 其余 = SFX 候选
 // （smain.fsb 不是音乐：sm 后面是 'a' 不是数字）
 static const char* classify(const std::string& base) {
     auto starts = [&](const char* p) {
@@ -137,6 +161,14 @@ static const char* classify(const std::string& base) {
     if (starts("vm")) return "SKIP(voice)";
     if (starts("sm") && base.size() > 2 && isdigit((unsigned char)base[2])) return "SKIP(music)";
     return "VIBRATE";
+}
+
+static bool starts_with_ci(const std::string& s, const char* prefix) {
+    return s.size() >= strlen(prefix) && _strnicmp(s.c_str(), prefix, strlen(prefix)) == 0;
+}
+
+static bool is_default_haptic_bank(const std::string& bank) {
+    return starts_with_ci(bank, "smain") || starts_with_ci(bank, "main");
 }
 
 static void logf(const char* fmt, ...) {
@@ -149,6 +181,254 @@ static void logf(const char* fmt, ...) {
     fflush(g_log);
 }
 
+struct EffectRule {
+    bool hasEnabled = false;
+    bool enabled = false;
+    bool hasGain = false;
+    float gain = 1.0f;
+    bool hasDump = false;
+    bool dump = false;
+};
+
+struct HapticConfig {
+    bool enabled = true;
+    bool dumpEnabled = false;
+    bool useBuiltinDefaults = true;
+    float defaultGain = 1.0f;
+    std::unordered_map<int, EffectRule> effects;
+};
+
+struct HapticDecision {
+    bool enabled = false;
+    bool dump = false;
+    bool attach = false;
+    float gain = 1.0f;
+};
+
+static std::once_flag g_appPathOnce;
+static char g_appDir[MAX_PATH] = "";
+static char g_cfgPath[MAX_PATH] = "";
+static char g_seenPath[MAX_PATH] = "";
+static char g_dumpDir[MAX_PATH] = "";
+static std::mutex g_cfgLock;
+static HapticConfig g_cfg;
+static std::once_flag g_cfgOnce;
+static std::mutex g_seenLock;
+static std::unordered_set<std::string> g_seenKeys;
+
+static void ensure_app_paths() {
+    std::call_once(g_appPathOnce, []() {
+        char* app = nullptr; size_t n = 0;
+        if (_dupenv_s(&app, &n, "APPDATA") == 0 && app) {
+            _snprintf_s(g_appDir, sizeof(g_appDir), _TRUNCATE, "%s\\DualSenseSfxHaptics", app);
+            free(app);
+        } else {
+            strncpy_s(g_appDir, sizeof(g_appDir), ".\\DualSenseSfxHaptics", _TRUNCATE);
+        }
+        CreateDirectoryA(g_appDir, nullptr);
+        _snprintf_s(g_cfgPath, sizeof(g_cfgPath), _TRUNCATE, "%s\\haptics.json", g_appDir);
+        _snprintf_s(g_seenPath, sizeof(g_seenPath), _TRUNCATE, "%s\\seen_effects.jsonl", g_appDir);
+        _snprintf_s(g_dumpDir, sizeof(g_dumpDir), _TRUNCATE, "%s\\dumps", g_appDir);
+        CreateDirectoryA(g_dumpDir, nullptr);
+    });
+}
+
+static std::string read_all_text(const char* path) {
+    FILE* f = nullptr;
+    fopen_s(&f, path, "rb");
+    if (!f) return std::string();
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len <= 0) { fclose(f); return std::string(); }
+    std::string s;
+    s.resize((size_t)len);
+    fread(&s[0], 1, (size_t)len, f);
+    fclose(f);
+    return s;
+}
+
+static void write_default_config_if_missing() {
+    ensure_app_paths();
+    DWORD attrs = GetFileAttributesA(g_cfgPath);
+    if (attrs != INVALID_FILE_ATTRIBUTES) return;
+    FILE* f = nullptr;
+    fopen_s(&f, g_cfgPath, "wb");
+    if (!f) return;
+    const char* text =
+        "{\n"
+        "  \"enabled\": true,\n"
+        "  \"defaultGain\": 1.0,\n"
+        "  \"dumpEnabled\": false,\n"
+        "  \"useBuiltinDefaults\": true,\n"
+        "  \"effects\": {}\n"
+        "}\n";
+    fwrite(text, 1, strlen(text), f);
+    fclose(f);
+}
+
+static const char* skip_ws(const char* p, const char* end) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+    return p;
+}
+
+static bool find_json_bool(const std::string& text, const char* key, bool* out) {
+    std::string needle = std::string("\"") + key + "\"";
+    size_t pos = text.find(needle);
+    if (pos == std::string::npos) return false;
+    pos = text.find(':', pos + needle.size());
+    if (pos == std::string::npos) return false;
+    const char* begin = text.c_str();
+    const char* p = skip_ws(begin + pos + 1, begin + text.size());
+    if (strncmp(p, "true", 4) == 0) { *out = true; return true; }
+    if (strncmp(p, "false", 5) == 0) { *out = false; return true; }
+    return false;
+}
+
+static bool find_json_float(const std::string& text, const char* key, float* out) {
+    std::string needle = std::string("\"") + key + "\"";
+    size_t pos = text.find(needle);
+    if (pos == std::string::npos) return false;
+    pos = text.find(':', pos + needle.size());
+    if (pos == std::string::npos) return false;
+    const char* begin = text.c_str();
+    const char* p = skip_ws(begin + pos + 1, begin + text.size());
+    char* endp = nullptr;
+    float v = strtof(p, &endp);
+    if (endp == p) return false;
+    *out = v;
+    return true;
+}
+
+static float clamp_gain(float gain) {
+    if (gain < 0.0f) return 0.0f;
+    if (gain > 8.0f) return 8.0f;
+    return gain;
+}
+
+static HapticConfig parse_config(const std::string& text) {
+    HapticConfig cfg;
+    size_t effectsPos = text.find("\"effects\"");
+    std::string root = effectsPos == std::string::npos ? text : text.substr(0, effectsPos);
+    bool b = false; float f = 0;
+    if (find_json_bool(root, "enabled", &b)) cfg.enabled = b;
+    if (find_json_bool(root, "dumpEnabled", &b)) cfg.dumpEnabled = b;
+    if (find_json_bool(root, "useBuiltinDefaults", &b)) cfg.useBuiltinDefaults = b;
+    if (find_json_float(root, "defaultGain", &f)) cfg.defaultGain = clamp_gain(f);
+
+    if (effectsPos == std::string::npos) return cfg;
+    size_t open = text.find('{', effectsPos);
+    if (open == std::string::npos) return cfg;
+    int depth = 0;
+    size_t close = std::string::npos;
+    for (size_t i = open; i < text.size(); ++i) {
+        if (text[i] == '{') ++depth;
+        else if (text[i] == '}' && --depth == 0) { close = i; break; }
+    }
+    if (close == std::string::npos) return cfg;
+    size_t pos = open + 1;
+    while (pos < close) {
+        size_t q1 = text.find('"', pos);
+        if (q1 == std::string::npos || q1 >= close) break;
+        size_t q2 = text.find('"', q1 + 1);
+        if (q2 == std::string::npos || q2 >= close) break;
+        std::string key = text.substr(q1 + 1, q2 - q1 - 1);
+        char* endp = nullptr;
+        int idx = (int)strtol(key.c_str(), &endp, 10);
+        size_t objOpen = text.find('{', q2);
+        if (!endp || *endp != 0 || objOpen == std::string::npos || objOpen >= close) { pos = q2 + 1; continue; }
+        int objDepth = 0;
+        size_t objClose = std::string::npos;
+        for (size_t i = objOpen; i < close; ++i) {
+            if (text[i] == '{') ++objDepth;
+            else if (text[i] == '}' && --objDepth == 0) { objClose = i; break; }
+        }
+        if (objClose == std::string::npos) break;
+        std::string body = text.substr(objOpen, objClose - objOpen + 1);
+        EffectRule rule;
+        if (find_json_bool(body, "enabled", &b)) { rule.hasEnabled = true; rule.enabled = b; }
+        if (find_json_float(body, "gain", &f)) { rule.hasGain = true; rule.gain = clamp_gain(f); }
+        if (find_json_bool(body, "dump", &b)) { rule.hasDump = true; rule.dump = b; }
+        cfg.effects[idx] = rule;
+        pos = objClose + 1;
+    }
+    return cfg;
+}
+
+static void load_config_once() {
+    std::call_once(g_cfgOnce, []() {
+        ensure_app_paths();
+        write_default_config_if_missing();
+        std::string text = read_all_text(g_cfgPath);
+        HapticConfig cfg = parse_config(text);
+        {
+            std::lock_guard<std::mutex> lock(g_cfgLock);
+            g_cfg = cfg;
+        }
+        logf("CFG: loaded %s enabled=%d defaultGain=%.2f dump=%d effects=%zu",
+             g_cfgPath, cfg.enabled ? 1 : 0, cfg.defaultGain, cfg.dumpEnabled ? 1 : 0, cfg.effects.size());
+    });
+}
+
+static HapticDecision decide_haptic(int idx, const std::string& bank, bool bankAllowsHaptics) {
+    load_config_once();
+    HapticDecision d;
+    if (!bankAllowsHaptics) return d;
+    std::lock_guard<std::mutex> lock(g_cfgLock);
+    if (!g_cfg.enabled) return d;
+    bool enabled = g_cfg.useBuiltinDefaults && (is_default_haptic_bank(bank) || (bank == "(unknown)" && is_haptic_event(idx)));
+    float gain = g_cfg.defaultGain;
+    bool dump = g_cfg.dumpEnabled;
+    auto it = idx >= 0 ? g_cfg.effects.find(idx) : g_cfg.effects.end();
+    if (it != g_cfg.effects.end()) {
+        const EffectRule& rule = it->second;
+        if (rule.hasEnabled) enabled = rule.enabled;
+        if (rule.hasGain) gain = rule.gain;
+        if (rule.hasDump && rule.dump) dump = true;
+    }
+    d.enabled = enabled;
+    d.gain = clamp_gain(gain);
+    d.dump = dump;
+    d.attach = enabled || dump;
+    return d;
+}
+
+static void json_escape(FILE* f, const char* s) {
+    if (!s) return;
+    for (const unsigned char* p = (const unsigned char*)s; *p; ++p) {
+        if (*p == '"' || *p == '\\') { fputc('\\', f); fputc(*p, f); }
+        else if (*p == '\n') fputs("\\n", f);
+        else if (*p == '\r') fputs("\\r", f);
+        else if (*p == '\t') fputs("\\t", f);
+        else if (*p >= 32) fputc(*p, f);
+    }
+}
+
+static void record_seen_effect(int idx, const std::string& bank, const char* subname, const char* verdict, bool haptic, float gain) {
+    ensure_app_paths();
+    char key[512];
+    _snprintf_s(key, sizeof(key), _TRUNCATE, "%d|%s", idx, bank.c_str());
+    std::lock_guard<std::mutex> lock(g_seenLock);
+    if (g_seenKeys.find(key) != g_seenKeys.end()) return;
+    g_seenKeys.insert(key);
+    FILE* f = nullptr;
+    fopen_s(&f, g_seenPath, "ab");
+    if (!f) return;
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    fprintf(f, "{\"time\":\"%04u-%02u-%02u %02u:%02u:%02u\",\"idx\":%d,\"bank\":\"",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, idx);
+    json_escape(f, bank.c_str());
+    fputs("\",\"sub\":\"", f);
+    json_escape(f, subname);
+    fputs("\",\"verdict\":\"", f);
+    json_escape(f, verdict);
+    fputs("\",\"meaning\":\"", f);
+    json_escape(f, sound_meaning(idx));
+    fprintf(f, "\",\"haptic\":%s,\"gain\":%.3f}\n", haptic ? "true" : "false", gain);
+    fclose(f);
+}
+
 // 查某个 Sound*（可能是子音）属于哪个 bank
 static std::string lookup_bank(void* sound) {
     if (!sound) return "(null)";
@@ -156,6 +436,8 @@ static std::string lookup_bank(void* sound) {
         std::lock_guard<std::mutex> g(g_lock);
         auto it = g_soundBank.find(sound);
         if (it != g_soundBank.end()) return it->second;
+        auto sub = g_subBank.find(sound);
+        if (sub != g_subBank.end()) return sub->second;
     }
     // 不是直接登记的 Sound：尝试反查父音
     if (g_getParent) {
@@ -215,9 +497,10 @@ static void diagnose_unknown(void* sound) {
 typedef struct FMOD_DSP_STATE_ { void* instance; void* plugindata; unsigned short speakermask; } FMOD_DSP_STATE_;
 // FMOD Ex 4.44 read 回调：最后两个参数都是 int 按值(inchannels, outchannels)，不是指针！
 typedef FMOD_RESULT (*FMOD_DSP_READCB)(FMOD_DSP_STATE_*, float*, float*, unsigned int, int, int);
+typedef FMOD_RESULT (*FMOD_DSP_RELEASECB)(FMOD_DSP_STATE_*);
 typedef struct FMOD_DSP_DESCRIPTION_ {
     char name[32]; unsigned int version; int channels;
-    void* create; void* release; void* reset;
+    void* create; FMOD_DSP_RELEASECB release; void* reset;
     FMOD_DSP_READCB read; void* setposition;
     int numparameters; void* paramdesc;
     void* setparameter; void* getparameter; void* config;
@@ -229,11 +512,17 @@ typedef FMOD_RESULT (*CreateDSP_t)(void*, const FMOD_DSP_DESCRIPTION_*, void**);
 typedef FMOD_RESULT (*AddDSP_t)(void*, void*, void**);
 typedef FMOD_RESULT (*SetCG_t)(void*, void*);
 typedef FMOD_RESULT (*GetMaster_t)(void*, void**);
+typedef FMOD_RESULT (*ChannelAddDSP_t)(void*, void*, void**);
+typedef FMOD_RESULT (*ChannelSetPaused_t)(void*, int);
+typedef FMOD_RESULT (*DSPRelease_t)(void*);
 static CreateCG_t  g_createCG  = nullptr;
 static CreateDSP_t g_createDSP = nullptr;
 static AddDSP_t    g_addDSP    = nullptr;
 static SetCG_t     g_setCG     = nullptr;
 static GetMaster_t g_getMaster = nullptr;
+static ChannelAddDSP_t   g_chAddDSP    = nullptr;
+static ChannelSetPaused_t g_chSetPaused = nullptr;
+static DSPRelease_t      g_dspRelease  = nullptr;
 
 // 声道组枚举（诊断：看游戏 event 系统的总线结构）
 typedef FMOD_RESULT (*CG_NumGroups_t)(void*, int*);
@@ -256,11 +545,36 @@ static void enum_groups(void* grp, int depth) {
 // 环形缓冲（单生产者=DSP混音线程，单消费者=WASAPI线程）
 static const unsigned RING = 16384, RMASK = RING - 1;
 static float g_ring[RING];
+static unsigned char g_ringDirect[RING];
 static std::atomic<unsigned> g_wr{0}, g_rd{0};
+static std::mutex g_ringLock;
 
 // 门控：音效播放时打开(=1)，之后逐采样衰减。haptic 输出 = master音频 × 门。
 static std::atomic<float> g_gate{0.0f};
 static const float GATE_DK = 0.99975f;   // 每采样衰减（≈200ms 尾巴）
+
+static float push_audio_to_ring(const float* in, unsigned int length, int inch, bool direct, float gain = 1.0f) {
+    if (!in || length == 0 || inch <= 0 || inch > 32) return 0.0f;
+    gain = clamp_gain(gain);
+    std::lock_guard<std::mutex> lock(g_ringLock);
+    unsigned w = g_wr.load(std::memory_order_relaxed);
+    float peak = 0;
+    for (unsigned int i = 0; i < length; ++i) {
+        float s = 0;
+        for (int c = 0; c < inch; ++c) s += in[i * inch + c];
+        if (inch > 1) s /= inch;
+        s *= gain;
+        if (s > 1.0f) s = 1.0f;
+        if (s < -1.0f) s = -1.0f;
+        g_ring[w & RMASK] = s;
+        g_ringDirect[w & RMASK] = direct ? 1 : 0;
+        ++w;
+        float a = s < 0 ? -s : s;
+        if (a > peak) peak = a;
+    }
+    g_wr.store(w, std::memory_order_release);
+    return peak;
+}
 
 // DSP 回调：透传 + 降混单声道入环。务必防 in/out 为空、inch 异常。
 static std::atomic<int> g_dspLogged{0};
@@ -271,15 +585,7 @@ static FMOD_RESULT dsp_read(FMOD_DSP_STATE_*, float* in, float* out, unsigned in
     int ch = (outch > 0 && outch < inch) ? outch : inch;   // 透传的声道数
     if (out && in) memcpy(out, in, (size_t)length * ch * sizeof(float));
     if (!in) return 0;                                      // 无输入时不入环
-    unsigned w = g_wr.load(std::memory_order_relaxed);
-    float dpeak = 0;
-    for (unsigned int i = 0; i < length; ++i) {
-        float s = 0; for (int c = 0; c < inch; ++c) s += in[i * inch + c];
-        if (inch > 1) s /= inch;
-        g_ring[w & RMASK] = s; ++w;
-        float a = s < 0 ? -s : s; if (a > dpeak) dpeak = a;
-    }
-    g_wr.store(w, std::memory_order_release);
+    float dpeak = push_audio_to_ring(in, length, inch, false);
     // 诊断：每约 200 次回调（~4s）报一次本批峰值
     static std::atomic<int> dc{0};
     static float dmax = 0; if (dpeak > dmax) dmax = dpeak;
@@ -289,24 +595,35 @@ static FMOD_RESULT dsp_read(FMOD_DSP_STATE_*, float* in, float* out, unsigned in
 
 // 由 haptic_out 渲染线程调用：从环形缓冲连续读 n 个单声道样本
 extern "C" int haptic_pull_audio(float* out, int n) {
-    unsigned wr = g_wr.load(std::memory_order_acquire);
-    unsigned rd = g_rd.load(std::memory_order_relaxed);
-    unsigned avail = wr - rd;
-    // 只保留 ~3 个 WASAPI 帧的 backlog：把延迟从 ~170ms(RING/2) 砍到 ~20-30ms，
-    // 并让"门"对齐到实时音频(否则门乘的是170ms前的旧音频、弹刀真音到时门已衰减)。
-    // 太小会欠载爆音/断音；触觉对 glitch 较宽容，可从此值(3)往下调。
-    unsigned target = 3u * (unsigned)n;
-    if (avail > target) rd = wr - target;
     float gate = g_gate.load(std::memory_order_relaxed);
     int got = 0; float peak = 0;
-    for (int i = 0; i < n; ++i) {
-        float v = 0;
-        if (rd != wr) { v = g_ring[rd & RMASK]; ++rd; got = 1; }
-        v *= gate; gate *= GATE_DK;                     // 乘门 + 衰减
-        out[i] = v;
-        float a = v < 0 ? -v : v; if (a > peak) peak = a;
+    unsigned avail = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_ringLock);
+        unsigned wr = g_wr.load(std::memory_order_acquire);
+        unsigned rd = g_rd.load(std::memory_order_relaxed);
+        avail = wr - rd;
+        // 只保留 ~3 个 WASAPI 帧的 backlog：把延迟从 ~170ms(RING/2) 砍到 ~20-30ms，
+        // 并让"门"对齐到实时音频(否则门乘的是170ms前的旧音频、弹刀真音到时门已衰减)。
+        // 太小会欠载爆音/断音；触觉对 glitch 较宽容，可从此值(3)往下调。
+        unsigned target = 3u * (unsigned)n;
+        if (avail > target) rd = wr - target;
+        for (int i = 0; i < n; ++i) {
+            float v = 0;
+            bool direct = false;
+            if (rd != wr) {
+                unsigned pos = rd & RMASK;
+                v = g_ring[pos];
+                direct = g_ringDirect[pos] != 0;
+                ++rd;
+                got = 1;
+            }
+            if (!direct) { v *= gate; gate *= GATE_DK; } // master 回退样本才乘门
+            out[i] = v;
+            float a = v < 0 ? -v : v; if (a > peak) peak = a;
+        }
+        g_rd.store(rd, std::memory_order_relaxed);
     }
-    g_rd.store(rd, std::memory_order_relaxed);
     g_gate.store(gate, std::memory_order_relaxed);
     // 诊断：每约 300 次（~3s）报一次消费端
     static std::atomic<int> pc{0}; static float pmax = 0; static unsigned amax = 0;
@@ -314,6 +631,158 @@ extern "C" int haptic_pull_audio(float* out, int n) {
     // PULL 刷屏日志已关闭(每帧写会独占锁死文件+刷爆日志)。需要诊断时再开。
     (void)pc; (void)pmax; (void)amax;
     return (got && peak >= 0.004f) ? 1 : 0;
+}
+
+static std::atomic<int> g_chDspLogged{0};
+static const int DUMP_MAX_FRAMES = 48000 * 3;
+static std::mutex g_dumpLock;
+
+struct DspContext {
+    int idx;
+    float gain;
+    bool dump;
+    bool haptic;
+};
+
+static std::unordered_map<void*, DspContext> g_dspContext;
+
+struct ChannelDump {
+    int idx;
+    int channels;
+    int frames;
+    FILE* file;
+    char path[MAX_PATH];
+};
+
+static void wav_write_header(FILE* f, int channels, int frames) {
+    if (!f) return;
+    unsigned sampleRate = 48000;
+    unsigned bits = 16;
+    unsigned dataBytes = (unsigned)frames * (unsigned)channels * (bits / 8);
+    unsigned riffBytes = 36 + dataBytes;
+    unsigned byteRate = sampleRate * (unsigned)channels * (bits / 8);
+    unsigned short blockAlign = (unsigned short)(channels * (bits / 8));
+    fseek(f, 0, SEEK_SET);
+    fwrite("RIFF", 1, 4, f); fwrite(&riffBytes, 4, 1, f); fwrite("WAVE", 1, 4, f);
+    fwrite("fmt ", 1, 4, f); unsigned fmtSize = 16; fwrite(&fmtSize, 4, 1, f);
+    unsigned short audioFormat = 1; fwrite(&audioFormat, 2, 1, f);
+    unsigned short ch = (unsigned short)channels; fwrite(&ch, 2, 1, f);
+    fwrite(&sampleRate, 4, 1, f); fwrite(&byteRate, 4, 1, f); fwrite(&blockAlign, 2, 1, f); fwrite(&bits, 2, 1, f);
+    fwrite("data", 1, 4, f); fwrite(&dataBytes, 4, 1, f);
+}
+
+static ChannelDump* create_channel_dump(int idx, int channels) {
+    ChannelDump* dump = new ChannelDump{};
+    dump->idx = idx;
+    dump->channels = (channels > 0 && channels <= 8) ? channels : 2;
+    ensure_app_paths();
+    CreateDirectoryA(g_dumpDir, nullptr);
+    const char* key = sound_group_key(idx);
+    char file[96] = "";
+    if (key && key[0]) _snprintf_s(file, sizeof(file), _TRUNCATE, "%s.wav", key);
+    else _snprintf_s(file, sizeof(file), _TRUNCATE, "idx%d.wav", idx);
+    _snprintf_s(dump->path, sizeof(dump->path), _TRUNCATE, "%s\\%s", g_dumpDir, file);
+    fopen_s(&dump->file, dump->path, "wb");
+    if (!dump->file) { delete dump; return nullptr; }
+    wav_write_header(dump->file, dump->channels, 0);
+    logf("CHDUMP: open %s ch=%d idx=%d group=%s", dump->path, dump->channels, idx, key ? key : "idx");
+    return dump;
+}
+
+static void write_channel_dump(ChannelDump* dump, const float* in, unsigned int length, int inch) {
+    if (!dump || !dump->file || !in || length == 0 || inch <= 0) return;
+    int remaining = DUMP_MAX_FRAMES - dump->frames;
+    if (remaining <= 0) return;
+    unsigned int frames = length < (unsigned int)remaining ? length : (unsigned int)remaining;
+    for (unsigned int i = 0; i < frames; ++i) {
+        for (int c = 0; c < dump->channels; ++c) {
+            float s = in[i * inch + (c < inch ? c : inch - 1)];
+            if (s > 1.0f) s = 1.0f;
+            if (s < -1.0f) s = -1.0f;
+            short v = (short)lrintf(s * 32767.0f);
+            fwrite(&v, sizeof(v), 1, dump->file);
+        }
+    }
+    dump->frames += (int)frames;
+    long endPos = ftell(dump->file);
+    wav_write_header(dump->file, dump->channels, dump->frames);
+    fseek(dump->file, endPos, SEEK_SET);
+    fflush(dump->file);
+}
+
+static void close_channel_dump(ChannelDump* dump) {
+    if (!dump) return;
+    if (dump->file) {
+        wav_write_header(dump->file, dump->channels, dump->frames);
+        fclose(dump->file);
+        logf("CHDUMP: close %s frames=%d idx=%d", dump->path, dump->frames, dump->idx);
+    }
+    delete dump;
+}
+
+static FMOD_RESULT channel_tap_release(FMOD_DSP_STATE_* state) {
+    void* dsp = state ? state->instance : nullptr;
+    logf("CHDSP: release dsp=%p", dsp);
+    if (state && state->plugindata) {
+        close_channel_dump((ChannelDump*)state->plugindata);
+        state->plugindata = nullptr;
+    }
+    if (dsp) {
+        std::lock_guard<std::mutex> lock(g_dumpLock);
+        g_dspContext.erase(dsp);
+    }
+    return 0;
+}
+
+static FMOD_RESULT channel_tap_read(FMOD_DSP_STATE_* state, float* in, float* out, unsigned int length, int inch, int outch) {
+    if (g_chDspLogged.exchange(1) == 0)
+        logf("CHDSP first read: in=%p out=%p length=%u inch=%d outch=%d", in, out, length, inch, outch);
+    if (inch <= 0 || inch > 32) return 0;
+    int ch = (outch > 0 && outch < inch) ? outch : inch;
+    if (out && in) memcpy(out, in, (size_t)length * ch * sizeof(float));
+    if (!in) return 0;
+    DspContext ctx{ -1, 1.0f, false, false };
+    if (state) {
+        std::lock_guard<std::mutex> lock(g_dumpLock);
+        auto it = g_dspContext.find(state->instance);
+        if (it != g_dspContext.end()) ctx = it->second;
+    }
+    if (state && !state->plugindata) {
+        state->plugindata = ctx.dump ? create_channel_dump(ctx.idx, ch) : nullptr;
+    }
+    if (state && state->plugindata) write_channel_dump((ChannelDump*)state->plugindata, in, length, inch);
+    float peak = ctx.haptic ? push_audio_to_ring(in, length, inch, true, ctx.gain) : 0.0f;
+    static std::atomic<int> pc{0}; static float pmax = 0;
+    if (peak > pmax) pmax = peak;
+    if (pc.fetch_add(1) % 400 == 399) { logf("CHDSP peak(last)=%.4f", pmax); pmax = 0; }
+    return 0;
+}
+
+static bool attach_channel_tap(void* system, void* channel, int subIdx, float gain, bool dump, bool haptic) {
+    if (!system || !channel || !g_createDSP || !g_chAddDSP) return false;
+    FMOD_DSP_DESCRIPTION_ d{};
+    d.name[0] = 'c'; d.name[1] = 'h'; d.name[2] = 't'; d.name[3] = 'a'; d.name[4] = 'p'; d.name[5] = 0;
+    d.version = 1; d.channels = 0; d.read = channel_tap_read; d.release = channel_tap_release;
+    void* dsp = nullptr;
+    FMOD_RESULT cr = g_createDSP(system, &d, &dsp);
+    if (cr != 0 || !dsp) { logf("CHDSP: CreateDSP failed r=%d channel=%p idx=%d", cr, channel, subIdx); return false; }
+    {
+        std::lock_guard<std::mutex> lock(g_dumpLock);
+        g_dspContext[dsp] = DspContext{ subIdx, gain, dump, haptic };
+    }
+    void* conn = nullptr;
+    FMOD_RESULT ar = g_chAddDSP(channel, dsp, &conn);
+    if (ar != 0) {
+        logf("CHDSP: Channel_AddDSP failed r=%d channel=%p dsp=%p idx=%d", ar, channel, dsp, subIdx);
+        {
+            std::lock_guard<std::mutex> lock(g_dumpLock);
+            g_dspContext.erase(dsp);
+        }
+        if (g_dspRelease) g_dspRelease(dsp);
+        return false;
+    }
+    logf("CHDSP: attached channel=%p dsp=%p conn=%p idx=%d gain=%.2f dump=%d haptic=%d (%s)", channel, dsp, conn, subIdx, gain, dump ? 1 : 0, haptic ? 1 : 0, sound_meaning(subIdx));
+    return true;
 }
 
 // 懒创建捕获组+DSP（需要 System*，由 playSound 的 self 提供）
@@ -405,20 +874,28 @@ extern "C" FMOD_RESULT createSoundInternal_detour(void* self, const char* nameOr
 extern "C" FMOD_RESULT getSubSoundCpp_detour(void* self, int index, void** subsound) {
     ensure_init();
     FMOD_RESULT r = g_getSubCpp ? g_getSubCpp(self, index, subsound) : -1;
-    if (r == 0 && subsound && *subsound) { std::lock_guard<std::mutex> g(g_lock); g_subIndex[*subsound] = index; }
+    if (r == 0 && subsound && *subsound) {
+        std::lock_guard<std::mutex> g(g_lock);
+        g_subIndex[*subsound] = index;
+        auto it = g_soundBank.find(self);
+        if (it != g_soundBank.end()) g_subBank[*subsound] = it->second;
+    }
     return r;
 }
 extern "C" FMOD_RESULT getSubSoundC_detour(void* self, int index, void** subsound) {
     ensure_init();
     FMOD_RESULT r = g_getSub ? g_getSub(self, index, subsound) : -1;
-    if (r == 0 && subsound && *subsound) { std::lock_guard<std::mutex> g(g_lock); g_subIndex[*subsound] = index; }
+    if (r == 0 && subsound && *subsound) {
+        std::lock_guard<std::mutex> g(g_lock);
+        g_subIndex[*subsound] = index;
+        auto it = g_soundBank.find(self);
+        if (it != g_soundBank.end()) g_subBank[*subsound] = it->second;
+    }
     return r;
 }
 
 extern "C" FMOD_RESULT playSound_detour(void* self, int channelid, void* sound, int paused, void** channel) {
     ensure_init();
-    FMOD_RESULT r = g_playSound(self, channelid, sound, paused, channel);
-
     std::string bank = lookup_bank(sound);
     char subname[256] = "";
     if (g_getName && sound) {
@@ -436,13 +913,24 @@ extern "C" FMOD_RESULT playSound_detour(void* self, int channelid, void* sound, 
     // 反查子声音 index（getSubSound hook 记录的）
     int subIdx = -1;
     { std::lock_guard<std::mutex> g(g_lock); auto it = g_subIndex.find(sound); if (it != g_subIndex.end()) subIdx = it->second; }
-    logf("PLAY  ch=%d sound=%p bank=%s sub=\"%s\" -> %s  idx=%d (%s)",
-         channelid, sound, bank.c_str(), subname, verdict, subIdx, subIdx >= 0 ? sound_meaning(subIdx) : "-");
-    if (verdict[0] == 'V') {            // VIBRATE
-        ensure_haptic();
-        ensure_capture(self);
-        if (is_haptic_event(subIdx))   // 仅在识别出的战斗事件开门 → 喂那一瞬真实音频
-            g_gate.store(1.0f, std::memory_order_relaxed);
+    HapticDecision haptic = decide_haptic(subIdx, bank, verdict[0] == 'V');
+    bool shouldHaptic = haptic.enabled;
+    int playPaused = shouldHaptic ? 1 : paused;
+    FMOD_RESULT r = g_playSound(self, channelid, sound, playPaused, channel);
+
+    record_seen_effect(subIdx, bank, subname, verdict, shouldHaptic, haptic.gain);
+    logf("PLAY  ch=%d sound=%p bank=%s sub=\"%s\" -> %s  idx=%d gain=%.2f dump=%d (%s)",
+         channelid, sound, bank.c_str(), subname, verdict, subIdx, haptic.gain, haptic.dump ? 1 : 0, subIdx >= 0 ? sound_meaning(subIdx) : "-");
+    if (haptic.attach) {
+        if (shouldHaptic) ensure_haptic();
+        bool tapped = (r == 0 && channel && *channel) ? attach_channel_tap(self, *channel, subIdx, haptic.gain, haptic.dump, shouldHaptic) : false;
+        if (g_chSetPaused && channel && *channel)
+            g_chSetPaused(*channel, paused ? 1 : 0);
+        if (shouldHaptic && !tapped) {
+            ensure_capture(self);
+            logf("CHDSP: fallback master gate channel=%p r=%d idx=%d", channel ? *channel : nullptr, r, subIdx);
+            g_gate.store(haptic.gain, std::memory_order_relaxed);
+        }
     }
     if (bank == "(unknown)") diagnose_unknown(sound);  // 仍只读记录少量样本，便于复核
     return r;
@@ -471,8 +959,8 @@ static void do_init() {
     g_createSoundInternal = (createSoundInternal_t) GetProcAddress(g_orig, "?createSoundInternal@SystemI@FMOD@@QEAA?AW4FMOD_RESULT@@PEBDIIIPEAUFMOD_CREATESOUNDEXINFO@@PEAPEAVFile@2@_NPEAPEAVSoundI@2@@Z");
     g_playSound    = (playSound_t)    GetProcAddress(g_orig, "?playSound@System@FMOD@@QEAA?AW4FMOD_RESULT@@W4FMOD_CHANNELINDEX@@PEAVSound@2@_NPEAPEAVChannel@2@@Z");
     g_getName      = (Sound_GetName_t)            GetProcAddress(g_orig, "FMOD_Sound_GetName");
-    g_getParent    = (Sound_GetSubSoundParent_t)  GetProcAddress(g_orig, "FMOD_Sound_GetSubSoundParent");
-    g_getNumSub    = (Sound_GetNumSubSounds_t)    GetProcAddress(g_orig, "FMOD_Sound_GetNumSubSounds");
+    g_getParent    = (SoundGetParent_t) GetProcAddress(g_orig, "FMOD_Sound_GetSubSoundParent");
+    g_getNumSub    = (SoundGetNumSub_t) GetProcAddress(g_orig, "FMOD_Sound_GetNumSubSounds");
     g_getSub       = (Sound_GetSubSound_t)        GetProcAddress(g_orig, "FMOD_Sound_GetSubSound");
     g_getSubCpp    = (Sound_GetSubSound_t)        GetProcAddress(g_orig, "?getSubSound@Sound@FMOD@@QEAA?AW4FMOD_RESULT@@HPEAPEAV12@@Z");
     // 震动用：声道组 + 捕获 DSP
@@ -481,6 +969,9 @@ static void do_init() {
     g_addDSP    = (AddDSP_t)    GetProcAddress(g_orig, "FMOD_ChannelGroup_AddDSP");
     g_setCG     = (SetCG_t)     GetProcAddress(g_orig, "FMOD_Channel_SetChannelGroup");
     g_getMaster = (GetMaster_t) GetProcAddress(g_orig, "FMOD_System_GetMasterChannelGroup");
+    g_chAddDSP    = (ChannelAddDSP_t)   GetProcAddress(g_orig, "FMOD_Channel_AddDSP");
+    g_chSetPaused = (ChannelSetPaused_t)GetProcAddress(g_orig, "FMOD_Channel_SetPaused");
+    g_dspRelease  = (DSPRelease_t)      GetProcAddress(g_orig, "FMOD_DSP_Release");
     g_cgNumGroups = (CG_NumGroups_t) GetProcAddress(g_orig, "FMOD_ChannelGroup_GetNumGroups");
     g_cgGetGroup  = (CG_GetGroup_t)  GetProcAddress(g_orig, "FMOD_ChannelGroup_GetGroup");
     g_cgGetName   = (CG_GetName_t)   GetProcAddress(g_orig, "FMOD_ChannelGroup_GetName");
@@ -497,6 +988,8 @@ static void do_init() {
     logf("thunks filled: %d/%d (null=%d)", THUNK_COUNT - thunkNull, THUNK_COUNT, thunkNull);
     logf("orig=%p createSound=%p createStream=%p createSoundInternal=%p playSound=%p getName=%p getParent=%p",
          g_orig, g_createSound, g_createStream, g_createSoundInternal, g_playSound, g_getName, g_getParent);
+        logf("haptic funcs: createDSP=%p chAddDSP=%p chSetPaused=%p dspRelease=%p",
+            g_createDSP, g_chAddDSP, g_chSetPaused, g_dspRelease);
     if (!g_createSound || !g_playSound)
         logf("WARNING: 关键函数指针为空，导出名可能与本机 fmodex64.dll 不符，需重新核对");
 }
