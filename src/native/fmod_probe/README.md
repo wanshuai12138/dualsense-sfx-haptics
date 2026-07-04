@@ -1,9 +1,9 @@
 # FMOD 探针（fmod_probe）— 只狼音频观测
 
-一个 **FMOD Ex 代理 DLL**，只读地记录《只狼》播放的每个声音来自哪个 `.fsb` bank，
-用来验证"排除 `sm*`(音乐) / `vm*`(语音)、其余全震"这条过滤规则。
+一个 **FMOD Ex 代理 DLL**，记录《只狼》播放的每个声音来自哪个 `.fsb` bank，
+并把确认过的单个音效 Channel 送到 DualSense / VB-CABLE。
 
-**不插手柄、不震动、不改游戏行为，纯打印日志。**
+当前推荐流程是：先只录候选 SFX，不震动；试听 WAV 后在 GUI 里手动勾选该震的 idx。
 
 ---
 
@@ -18,10 +18,11 @@
 
 游戏察觉不到差别，照常运行；我们在旁边记账。
 
-判断逻辑（在 `dllmain.cpp::classify`）：
+基础分类逻辑（在 `dllmain.cpp::classify`）：
+
 - 文件名以 `vm` 开头 → `SKIP(voice)`
 - 文件名 `sm` + 数字（如 `sm11.fsb`）→ `SKIP(music)`（注意 `smain.fsb` 不算音乐）
-- 其余 → `VIBRATE`
+- 其余 → SFX 候选；默认只录，手动勾选后才震
 
 ---
 
@@ -48,13 +49,14 @@ cmake --build build --config Release
 6. 退出，查看日志：`%USERPROFILE%\Desktop\fmod_probe_log.txt`
 
 ### 恢复原状
+
 删掉代理 `fmodex64.dll`，把 `fmodex64_orig.dll` 改回 `fmodex64.dll` 即可。
 
 ---
 
 ## 日志怎么读
 
-```
+```text
 === fmod_probe loaded ===
 orig=... createSound=... playSound=...        ← 指针都非空 = hook 生效
 CREATE sound=0x... bank=smain.fsb mode=0x...  ← 某个 bank 被加载
@@ -63,14 +65,15 @@ PLAY  ch=-1 sound=0x... bank=sm11.fsb  sub="3"   -> SKIP(music)
 PLAY  ch=-1 sound=0x... bank=vm11.fsb  sub="..." -> SKIP(voice)
 ```
 
-### 这局要回答的问题（决定最终过滤逻辑）
-- [ ] 战斗音（格挡/受伤）的 `bank` 是不是 `smain.fsb` / `c####.fsb`？→ 确认归 VIBRATE
+### 这局要回答的问题（决定白名单）
+
+- [ ] 战斗音（格挡/受伤）的 `bank` 是不是 `smain.fsb` / `c####.fsb`？→ 录音试听后勾选
 - [ ] BGM 播放时 `bank` 是不是 `sm##.fsb`？→ 确认 `sm+数字` 规则成立
 - [ ] 对话时 `bank` 是不是 `vm##.fsb`？
 - [ ] 有没有大量 `bank=(unknown)`？→ 说明子音→父音反查没覆盖，需要在 `createSound` 时枚举子音补登记
 - [ ] `xm##.fsb`、`smain_<lang>.fsb` 到底装什么、归哪类？
 
-把日志贴回来，我据此把 `classify()` 的规则定死，再进入"输出震动"阶段。
+把日志和 WAV 听感对上后，再把该震的 idx 写进 GUI 配置。
 
 ---
 

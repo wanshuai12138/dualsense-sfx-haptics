@@ -2,29 +2,6 @@
   "enabled": true,
   "defaultGain": 1.0,
   "dumpEnabled": true,
-  "useBuiltinDefaults": true,
-  "effects": {
-    "681": {
-      "enabled": true,
-      "gain": 3.0,
-      "dump": true,
-      "name": "deflect"
-    },
-    "853": {
-      "enabled": true,
-      "gain": 2.5,
-      "dump": true,
-      "name": "deathblow"
-    },
-    "1131": {
-      "enabled": true,
-      "gain": 1.0,
-      "name": "unknown sfx"
-    },
-    "1132": {
-      "enabled": true,
-      "gain": 1.0,
-      "name": "unknown sfx"
-    }
-  }
+  "useBuiltinDefaults": false,
+  "effects": {}
 }

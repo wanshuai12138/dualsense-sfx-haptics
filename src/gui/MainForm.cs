@@ -36,6 +36,7 @@ public class MainForm : Form
     NumericUpDown numDefaultGain = null!;
     DataGridView gridEffects = null!;
     Button btnReloadEffects = null!, btnSaveEffects = null!, btnOpenDumpDir = null!, btnPlayDump = null!;
+    Button btnReviewMode = null!, btnEnableSelected = null!, btnDisableSelected = null!;
     Panel panelEffects = null!;
     Label lblMsg = null!;
     System.Windows.Forms.Timer statusTimer = null!;
@@ -172,17 +173,17 @@ public class MainForm : Form
         };
         panelEffects.Controls.Add(chkGlobalEnabled);
         chkUseBuiltinDefaults = new CheckBox {
-            Text = "稳定默认", Location = new Point(104, 28), Size = new Size(90, 22), ForeColor = FG, Checked = true
+            Text = "内置白名单", Location = new Point(104, 28), Size = new Size(100, 22), ForeColor = FG, Checked = false
         };
         panelEffects.Controls.Add(chkUseBuiltinDefaults);
         chkDumpEnabled = new CheckBox {
-            Text = "录遇到的所有音效", Location = new Point(206, 28), Size = new Size(138, 22), ForeColor = FG
+            Text = "录遇到的所有音效", Location = new Point(216, 28), Size = new Size(138, 22), ForeColor = FG
         };
         panelEffects.Controls.Add(chkDumpEnabled);
-        var gainLabel = new Label { Text = "默认强度", Location = new Point(354, 31), Size = new Size(68, 20), ForeColor = MUTE };
+        var gainLabel = new Label { Text = "默认强度", Location = new Point(364, 31), Size = new Size(68, 20), ForeColor = MUTE };
         panelEffects.Controls.Add(gainLabel);
         numDefaultGain = new NumericUpDown {
-            Location = new Point(424, 28), Size = new Size(64, 24), DecimalPlaces = 1, Increment = 0.1M,
+            Location = new Point(434, 28), Size = new Size(64, 24), DecimalPlaces = 1, Increment = 0.1M,
             Minimum = 0, Maximum = 8, Value = 1.0M, BackColor = Color.FromArgb(28, 30, 36), ForeColor = FG
         };
         panelEffects.Controls.Add(numDefaultGain);
@@ -198,18 +199,27 @@ public class MainForm : Form
         btnPlayDump = MakeButton("试听录音", 14, 56, 92);
         btnPlayDump.Click += (s, e) => PlaySelectedDump();
         panelEffects.Controls.Add(btnPlayDump);
-        btnOpenDumpDir = MakeButton("打开录音目录", 116, 56, 112);
+        btnEnableSelected = MakeButton("启用选中", 116, 56, 92);
+        btnEnableSelected.Click += (s, e) => SetSelectedEnabled(true);
+        panelEffects.Controls.Add(btnEnableSelected);
+        btnDisableSelected = MakeButton("禁用选中", 218, 56, 92);
+        btnDisableSelected.Click += (s, e) => SetSelectedEnabled(false);
+        panelEffects.Controls.Add(btnDisableSelected);
+        btnReviewMode = MakeButton("试听标注模式", 320, 56, 118, accent: true);
+        btnReviewMode.Click += (s, e) => ApplyReviewMode();
+        panelEffects.Controls.Add(btnReviewMode);
+        btnOpenDumpDir = MakeButton("打开录音目录", 448, 56, 112);
         btnOpenDumpDir.Click += (s, e) => OpenDumpDir();
         panelEffects.Controls.Add(btnOpenDumpDir);
         var hint = new Label {
-            Text = "稳定默认：smain/已确认动作音震；rm/xm/未知音只录不震，可在表格单独启用。同一分组只保留最新 WAV。",
-            Location = new Point(242, 60), Size = new Size(panelEffects.Width - 256, 20), ForeColor = MUTE,
+            Text = "试听标注模式：只录音不震动；听到想要的 WAV 后勾启用/调强度，保存并重启游戏。同一分组只保留最新 WAV。",
+            Location = new Point(14, 88), Size = new Size(panelEffects.Width - 28, 20), ForeColor = MUTE,
             Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
         };
         panelEffects.Controls.Add(hint);
 
         gridEffects = new DataGridView {
-            Location = new Point(14, 86), Size = new Size(panelEffects.Width - 28, panelEffects.Height - 100),
+            Location = new Point(14, 112), Size = new Size(panelEffects.Width - 28, panelEffects.Height - 126),
             AllowUserToAddRows = false, AllowUserToDeleteRows = false, RowHeadersVisible = false,
             SelectionMode = DataGridViewSelectionMode.FullRowSelect, MultiSelect = false,
             BackgroundColor = Color.FromArgb(28, 30, 36), BorderStyle = BorderStyle.FixedSingle,
@@ -275,8 +285,8 @@ public class MainForm : Form
         var root = new JsonObject {
             ["enabled"] = true,
             ["defaultGain"] = 1.0,
-            ["dumpEnabled"] = false,
-            ["useBuiltinDefaults"] = true,
+                ["dumpEnabled"] = true,
+                ["useBuiltinDefaults"] = false,
             ["effects"] = new JsonObject()
         };
         File.WriteAllText(HapticsConfigFile, root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
@@ -288,9 +298,10 @@ public class MainForm : Form
         {
             EnsureDefaultHapticsConfig();
             var rows = new Dictionary<int, EffectRow>();
-            SeedKnownEffects(rows);
-            LoadSeenEffects(rows);
             var configured = LoadConfiguredEffects(out bool enabled, out bool useBuiltin, out bool dumpEnabled, out decimal defaultGain);
+
+            SeedKnownEffects(rows, useBuiltin);
+            LoadSeenEffects(rows);
 
             chkGlobalEnabled.Checked = enabled;
             chkUseBuiltinDefaults.Checked = useBuiltin;
@@ -301,7 +312,7 @@ public class MainForm : Form
             {
                 if (!rows.TryGetValue(kv.Key, out var row))
                 {
-                    row = new EffectRow { Idx = kv.Key, Group = GroupKey(kv.Key), Meaning = kv.Value.Name, Enabled = kv.Value.HasEnabled ? kv.Value.Enabled : IsKnownDefaultIdx(kv.Key), Verdict = "config" };
+                    row = new EffectRow { Idx = kv.Key, Group = GroupKey(kv.Key), Meaning = kv.Value.Name, Enabled = kv.Value.HasEnabled ? kv.Value.Enabled : useBuiltin && IsKnownDefaultIdx(kv.Key), Verdict = "config" };
                     rows[kv.Key] = row;
                 }
                 if (string.IsNullOrWhiteSpace(row.Group)) row.Group = GroupKey(row.Idx);
@@ -325,7 +336,7 @@ public class MainForm : Form
 
     Dictionary<int, EffectConfig> LoadConfiguredEffects(out bool enabled, out bool useBuiltin, out bool dumpEnabled, out decimal defaultGain)
     {
-        enabled = true; useBuiltin = true; dumpEnabled = false; defaultGain = 1.0M;
+        enabled = true; useBuiltin = false; dumpEnabled = true; defaultGain = 1.0M;
         var map = new Dictionary<int, EffectConfig>();
         var root = JsonNode.Parse(File.ReadAllText(HapticsConfigFile)) as JsonObject;
         if (root == null) return map;
@@ -392,11 +403,12 @@ public class MainForm : Form
         catch (Exception ex) { Msg("保存音效配置失败：" + ex.Message, BAD); }
     }
 
-    void SeedKnownEffects(Dictionary<int, EffectRow> rows)
+    void SeedKnownEffects(Dictionary<int, EffectRow> rows, bool useBuiltinDefaults)
     {
         void Add(int idx, string name, bool enabled)
         {
-            if (!rows.ContainsKey(idx)) rows[idx] = new EffectRow { Idx = idx, Group = GroupKey(idx), Meaning = name, Enabled = enabled, Verdict = enabled ? "builtin" : "manual-off" };
+            bool active = useBuiltinDefaults && enabled;
+            if (!rows.ContainsKey(idx)) rows[idx] = new EffectRow { Idx = idx, Group = GroupKey(idx), Meaning = name, Enabled = active, Verdict = active ? "builtin" : "manual-off" };
         }
         for (int i = 665; i <= 700; i++) Add(i, "弹刀/格挡", true);
         Add(408, "危攻蓄力", true);
@@ -445,7 +457,7 @@ public class MainForm : Form
                 string verdict = obj["verdict"]?.GetValue<string>() ?? "";
                 if (!rows.TryGetValue(idx, out var row))
                 {
-                    row = new EffectRow { Idx = idx, Group = GroupKey(idx), Enabled = !verdict.StartsWith("SKIP", StringComparison.OrdinalIgnoreCase), Gain = 1.0M };
+                    row = new EffectRow { Idx = idx, Group = GroupKey(idx), Enabled = false, Gain = 1.0M };
                     rows[idx] = row;
                 }
                 if (string.IsNullOrWhiteSpace(row.Group)) row.Group = GroupKey(idx);
@@ -462,6 +474,34 @@ public class MainForm : Form
     {
         Directory.CreateDirectory(DumpDir);
         Process.Start(new ProcessStartInfo(DumpDir) { UseShellExecute = true });
+    }
+
+    void SetSelectedEnabled(bool enabled)
+    {
+        if (gridEffects.CurrentRow == null) { Msg("先选中一个音效。", MUTE); return; }
+        string verdict = Convert.ToString(gridEffects.CurrentRow.Cells["colVerdict"].Value, CultureInfo.InvariantCulture) ?? "";
+        if (verdict.StartsWith("SKIP", StringComparison.OrdinalIgnoreCase)) { Msg("这是音乐/语音分类，不建议启用。", MUTE); return; }
+        gridEffects.CurrentRow.Cells["colEnabled"].Value = enabled;
+        gridEffects.CurrentRow.DefaultCellStyle.ForeColor = enabled ? FG : MUTE;
+        Msg(enabled ? "已勾选；记得保存配置并重启游戏。" : "已取消勾选；记得保存配置并重启游戏。", MUTE);
+    }
+
+    void ApplyReviewMode()
+    {
+        if (MessageBox.Show(
+                "试听标注模式会关闭内置白名单，并取消当前列表里所有音效的启用状态。\n\n游戏里只录候选音效，不会把未确认声音送到手柄。继续吗？",
+                "试听标注模式", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        chkGlobalEnabled.Checked = true;
+        chkUseBuiltinDefaults.Checked = false;
+        chkDumpEnabled.Checked = true;
+        foreach (DataGridViewRow row in gridEffects.Rows)
+        {
+            if (row.IsNewRow) continue;
+            row.Cells["colEnabled"].Value = false;
+            row.DefaultCellStyle.ForeColor = MUTE;
+        }
+        SaveEffectsConfig();
+        Msg("✓ 已切到试听标注模式：只录不震。请重启只狼后触发音效，再回来试听勾选。", OK);
     }
 
     void PlaySelectedDump()

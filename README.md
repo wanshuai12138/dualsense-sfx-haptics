@@ -12,14 +12,14 @@
 
 最终稳定策略不是“所有非音乐/语音都震”。实际测试发现这样会把区域音、脚步、环境和杂项事件都带进触觉，手感会乱。
 
-当前稳定策略是：
+当前推荐策略是先进入“试听标注模式”：
 
 ```text
 vm*              -> 语音，不震
 sm##.fsb         -> 地图 BGM，不震
-smain*/main      -> 通用动作/战斗 SFX，默认震
-(unknown)        -> 只对旧实测确认的 idx 兜底震
-rm##/xm##        -> 默认只录不震，可在 GUI 单独启用
+所有 SFX 候选     -> 默认只录不震
+确认过的 idx      -> 在 GUI 手动勾选后才震
+内置白名单        -> 可选开启，用旧实测 idx 快速起步
 ```
 
 配置不再热更新。GUI 保存配置后，需要重启只狼才会让 DLL 重新读取配置。
@@ -36,7 +36,8 @@ rm##/xm##        -> 默认只录不震，可在 GUI 单独启用
 | 6. GUI 配置 | 改参数要重新编译或手改 JSON | WinForms GUI 管理安装、录音、idx、强度和启用状态 | [src/gui/MainForm.cs](src/gui/MainForm.cs) |
 | 7. 录音模式 | 只能录启用触觉的声音 | 全局录音可录遇到的 SFX，但未启用的声音不震 | `decide_haptic`, `channel_tap_read` |
 | 8. 分类整理 | dumps 里全是平铺 WAV，不好查 | 根据 `seen_effects.jsonl` 把 WAV 复制到 `dumps_by_fsb` | AppData 运行数据 |
-| 9. 策略收敛 | “非对白/音乐全震”实际太乱 | 改为稳定默认：`smain*` 和确认 idx 震，`rm/xm` 先录不震 | `decide_haptic`, GUI 默认项 |
+| 9. 策略收敛 | “非对白/音乐全震”实际太乱 | 改为手动白名单：先录音试听，再勾选确认 idx | `decide_haptic`, GUI 默认项 |
+| 10. 触觉混音 | 多个音效按 DSP 回调顺序挤进 ring，手感会串 | 改为按输出时间轴叠加混音，并用 soft limiter 收峰值 | `push_audio_to_ring`, `haptic_pull_audio` |
 
 ## 原始问题
 
@@ -225,7 +226,7 @@ push_audio_to_ring(in, length, inch, true, ctx.gain);
 
 ```text
 Channel PCM -> WAV 文件
-Channel PCM -> haptic ring -> WASAPI -> DualSense / VB-CABLE
+Channel PCM -> haptic mixer -> soft limiter -> WASAPI -> DualSense / VB-CABLE
 ```
 
 ## WAV 导出实现
@@ -283,11 +284,16 @@ wav_write_header(FILE* f, int channels, int frames)
 
 ```text
 channel_tap_read
-  -> push_audio_to_ring
+        -> push_audio_to_ring       # 按输出时间轴叠加到 mixer ring
   -> haptic_pull_audio
+        -> soft limiter
   -> WASAPI render thread
   -> DualSense ch3/ch4 或 CABLE Input
 ```
+
+多个启用音效同时触发时，不再按回调顺序排队串起来，而是写到同一条短延迟时间轴上叠加。`haptic_pull_audio` 读取后会清空已消费样本，并对混合结果做 soft limiter，减少削顶导致的硬、糊、怪。
+
+每个触觉 Channel 还会先做触觉整形：约 115Hz 高通去掉低频拖尾，快速包络突出瞬态起点，再进入 mixer。事件寿命按 idx 分组压短，例如弹刀/危攻约 125ms，处决/受伤约 200ms，未知事件约 250ms；连续约 25ms 低电平后也会自动停止。这样弹刀、处决这类瞬态音效不会因为 FMOD Channel 尾巴、循环残留或低电平噪声一直震动；WAV 录音仍保持完整，方便继续试听标注。
 
 两种输出目标：
 
@@ -341,7 +347,7 @@ vm* 和 sm## 跳过，其余默认震
 
 实际结果是震动更乱，因为 `rm##`、`xm##`、大量 `(unknown)` 会包含脚步、区域环境、杂项事件。
 
-### 当前稳定版
+### 当前推荐版：手动白名单
 
 现在的默认策略在：
 
@@ -349,20 +355,20 @@ vm* 和 sm## 跳过，其余默认震
 decide_haptic(int idx, const std::string& bank, bool bankAllowsHaptics)
 ```
 
-核心判断：
+核心判断仍保留内置白名单开关：
 
 ```cpp
 bool enabled = g_cfg.useBuiltinDefaults &&
     (is_default_haptic_bank(bank) || (bank == "(unknown)" && is_haptic_event(idx)));
 ```
 
-含义：
+但新配置默认关闭 `useBuiltinDefaults`，打开 `dumpEnabled`。含义是：
 
 ```text
-smain*/main  -> 默认震
-(unknown)    -> 只有旧实测确认 idx 才震
-rm##/xm##    -> 默认只录不震，GUI 可手动启用
-vm*/sm##     -> 跳过
+vm*/sm##       -> 跳过，不录不震
+SFX 候选        -> 录 WAV，不震
+GUI 勾选 idx    -> 下次启动游戏后震
+内置白名单开启   -> 旧实测动作音自动震
 ```
 
 ## 配置系统改动
@@ -379,8 +385,8 @@ vm*/sm##     -> 跳过
 {
   "enabled": true,
   "defaultGain": 1.0,
-  "dumpEnabled": false,
-  "useBuiltinDefaults": true,
+        "dumpEnabled": true,
+        "useBuiltinDefaults": false,
   "effects": {
     "853": { "enabled": true, "gain": 2.5, "dump": true, "name": "deathblow" }
   }
@@ -391,8 +397,8 @@ vm*/sm##     -> 跳过
 
 - `enabled` 是全局触觉开关。
 - `defaultGain` 是默认强度。
-- `dumpEnabled` 表示录遇到的所有 SFX Channel。
-- `useBuiltinDefaults` 表示使用当前稳定默认策略。
+- `dumpEnabled` 表示录遇到的所有 SFX Channel，推荐标注阶段保持开启。
+- `useBuiltinDefaults` 表示启用旧实测白名单；关闭时只按 `effects` 里的手动勾选项震。
 - `effects` 可按 idx 覆盖启用状态、强度、录音和名称。
 
 曾经实现过运行时热更新，但实际体验不稳定，已经移除。现在 DLL 每个只狼进程只读取一次配置，保存后需要重启游戏生效。
@@ -569,7 +575,7 @@ CHDSP: attached channel=...
 
 - 早期录制文件很多属于 `unknown_fsb`，因为当时还没有完整记录子声音父 bank。
 - `smain*.fsb` 无法直接通过字符串扫描恢复官方样本名。
-- `rm##/xm##` 默认不震，是为了避免乱震；需要通过录音试听后手动启用。
+- 当前默认是手动白名单，所有未确认 SFX 都只录不震；需要通过录音试听后手动启用。
 - GUI 仍然是调试工具形态，适合标注和调参，不是最终发行 UI。
 - 配置不热更新，改完要重启游戏。
 
