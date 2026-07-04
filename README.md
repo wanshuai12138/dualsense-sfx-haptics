@@ -1,178 +1,592 @@
-# 🎮 DualSense 音效触觉（只狼）
+# DualSense SFX Haptics 改进记录与实现说明
 
-给 PC 版《只狼：影逝二度》补上 **Sony DualSense 手柄的细腻音效触觉** ——
-**只有音效震动，音乐和语音不震。**
+- 从 FMOD 内部识别音乐、语音和音效。
+- 从“master 混音触发震动”改成“单个 FMOD Channel 捕获”。
+- 把单个 Channel 的 PCM 写成 WAV，方便试听、标注、分类。
+- 把捕获到的音效送到 DualSense ch3/ch4 或 VB-CABLE/DSX 做触觉。
+- 用 GUI 管理安装、输出目标、录音、idx 启用状态和强度。
 
-> 现有方案（如 DSX 的 Audio-to-Haptics）会把**所有声音**都转成震动，音乐、对白全在抖。
-> 本工具通过 Hook 游戏的 FMOD 音频引擎，**从源头识别音乐/语音**，排除对白和 BGM；
-> 通用动作/战斗音效默认驱动手柄触觉，区域/额外事件音可录下来后在 GUI 里单独启用。
+当前实现只读观察单机游戏音频，不包含游戏资源，不改存档，不解包游戏文件。
 
-弹刀、命中、危攻、处决那一下，用的是**游戏真实音频**喂进手柄的触觉音圈，手感接近第一方游戏。
+## 当前结论
 
----
+最终稳定策略不是“所有非音乐/语音都震”。实际测试发现这样会把区域音、脚步、环境和杂项事件都带进触觉，手感会乱。
 
-## ⚠️ 先看这里（重要）
-
-- **仅限 PC 单机《只狼》**。声音编号是针对当前 Steam 版《只狼》实测标定的，换游戏/大版本可能要重新标定。
-- **DualSense 必须用 USB 连接**（细腻触觉走手柄的 ch3/4 音频音圈，蓝牙用不了）。
-- 手柄进游戏靠 **Steam Input**（模拟 Xbox 手柄）；本工具只负责触觉输出，不抢输入。
-- 这是**早期版本**：战斗撞击手感已经很好；闪避/UI/心跳/传送等系统音还在打磨（可能偏糊或有延迟）。
-- 首次运行 exe 和注入 DLL 可能被 **Windows SmartScreen / 杀软**拦截（未签名 + 代理 DLL）。本工具只读观察单机游戏音频、不联机、不改存档、不规避反作弊；介意者可自行看源码自编译。
-
----
-
-## 📥 下载与安装
-
-1. 到 [Releases](../../releases) 下载最新的 `DualSenseSfxHaptics-vX.Y.zip`，解压到任意文件夹。
-2. 双击 **`DualSenseSfxHaptics.exe`** 打开控制面板。
-3. **游戏目录**：一般会自动检测到只狼；没有的话点"浏览"选到含 `sekiro.exe` 的目录。
-4. **关掉只狼**（如果开着），点 **「安装到游戏」**。
-   工具会把游戏原本的 `fmodex64.dll` 备份为 `fmodex64_orig.dll`，再放入我们的代理 DLL。
-5. 界面显示 **「代理已安装 ✓」** 即成功。
-
-**卸载/还原**：面板点「卸载 / 还原」即可恢复游戏原状（或手动把 `fmodex64_orig.dll` 改回 `fmodex64.dll`）。
-
----
-
-## 🎮 使用：两种触觉输出
-
-| 方式 | 需要的软件 | 手感 | 适合 |
-|---|---|---|---|
-| **虚拟声卡 → DSX** ⭐**强烈推荐** | VB-CABLE（免费）+ DSX（Steam 付费） | **最佳** | 想要真正的细腻触觉 |
-| DualSense ch3/4 直驱 | 无，开箱即用 | 一般（**弹刀等高频音较弱/几乎不震**） | 手头没 DSX，先随便试试 |
-
-> **为什么强烈推荐 DSX 那条路？**
-> 手柄的触觉音圈只能有效感受 **~50–300Hz 的低频**。直驱是把音频**原样**喂给音圈——像**弹刀**
-> 这种高频金属声会被音圈滤掉、几乎不震。而 **DSX 的 Audio-to-Haptics 会做"包络提取 + 低频合成"**：
-> 把高频音的"强度"转成低频冲击，所以**不管什么音效都能变成手上摸得到的细腻触觉**。
-> 本工具负责"只把音效抓出来"，DSX 负责"把音效变成好触觉"，**两者结合才是完全体**。
-
----
-
-### 🅰️ 推荐路线：VB-CABLE + DSX（手感最佳）
-
-#### 先搞懂音频怎么流转（理解了就不会配错）
-
-```
- 只狼的音效 ──本工具抓取──▶  CABLE Input  ──DSX 从这里监听──▶  DSX ──▶ 手柄触觉
-（音乐/语音不抓）            (虚拟声卡·播放端)                    转触觉
-```
-
-- **VB-CABLE 是一根"虚拟音频线"**：装好后系统里会出现一对设备——**CABLE Input**（播放端）和 **CABLE Output**（录音端）。
-- 本工具把**抓到的音效**送进 **CABLE Input**；**DSX 直接监听 CABLE Input**（loopback 抓取这个播放端的声音），转成手柄触觉。
-  （所以我们用到的是 **CABLE Input** 这一端；CABLE Output 用不到。）
-- ✅ **游戏正常声音不受影响**：本工具是**单独复制一份音效**送去虚拟声卡，你的**喇叭/耳机照常出声**，
-  **不需要改 Windows 默认播放设备**。
-
-#### 步骤
-
-**① 安装 VB-CABLE（免费）**
-- **最简单**：打开本工具 → 点「触觉输出」区的 **「↓ 一键下载安装 VB-CABLE」** → 同意 →
-  工具从 VB-Audio 官方下载并打开安装器 → 点 `Install Driver` → **重启电脑**。
-- **或手动**：打开 https://vb-audio.com/Cable/ 下载 → 右键 `VBCABLE_Setup_x64.exe` 以管理员运行 →
-  `Install Driver` → **重启电脑**。
-- 装好后系统里应能看到 **CABLE Input** 和 **CABLE Output** 两个设备（本工具状态栏也会显示「✓ VB-CABLE 已安装」）。
-
-**② 安装 DSX** —— 在 **Steam** 搜索安装 **DSX（DualSenseX）**（付费应用）。
-
-**③ 安装本工具代理** —— 打开 `DualSenseSfxHaptics.exe` → 选游戏目录 → **关掉只狼** →
-点 **「安装到游戏」** → 显示「代理已安装 ✓」。
-
-**④ 本工具输出切到虚拟声卡** —— 面板「触觉输出」选 **「虚拟声卡 → DSX」**。
-工具会自动把音效送进 CABLE Input，**你不用在 Windows 声音设置里做任何改动**。
-
-**⑤ 配置 DSX 的音频来源（关键！最容易选错的一步）**
-1. 打开 DSX，找到 **Audio to Haptics**（音频→触觉）功能，**开启**。
-2. 把它的**音频输入/监听设备**选成 👉 **`CABLE Input (VB-Audio Virtual Cable)`**
-   —— 就是那个带 **CABLE** 字样的虚拟声卡（本工具把音效送进这里、DSX 从这里 loopback 监听）；不是你的喇叭、不是"默认设备"。
-   > 若你的 DSX 版本里选 Input 没反应，再试 **CABLE Output**；核心是选那个带 **CABLE** 字样的虚拟声卡。
-3. （可选）在 DSX 里把强度、低通调到你喜欢的手感。
-
-**⑥ 开玩** —— **USB** 接 DualSense → Steam 给只狼开 **Steam Input** → 启动游戏 →
-战斗时手柄就有**只含音效**的细腻触觉了 🎉
-
-> ⚠️ **常见坑**
-> - **DSX 里设备选错**（选成喇叭/默认设备）→ 会把**所有声音**都转触觉，音乐也震 → **必须选带 CABLE 字样的虚拟声卡（先试 CABLE Input）**。
-> - **别**把 CABLE 设成 Windows 默认播放设备（那样游戏声音会跑进虚拟线、喇叭反而没声）。本工具已单独送 CABLE，无需这么做。
-> - **不震/没声**：确认 VB-CABLE 已装且**重启过**、本工具输出是「虚拟声卡→DSX」、DSX 的 Audio to Haptics 已开且选了 CABLE Input。
-
----
-
-### 🅱️ 省事路线：DualSense ch3/4 直驱（不装任何额外软件）
-
-1. 双击 `DualSenseSfxHaptics.exe` → 关游戏 → **「安装到游戏」**。
-2. 触觉输出选 **「DualSense ch3/4 直驱」**。
-3. **USB** 接 DualSense → Steam Input 启动只狼 → 开玩。
-
-> 直驱由本工具自己驱动手柄的 ch3/4 触觉音圈，不需要 VB-CABLE / DSX，手感也不错，只是不如 DSX 处理细腻。
-
----
-
-## 🎛️ 目前会震动的声音
-
-默认策略：**对白和背景音乐不震；`smain*.fsb`/已确认动作音震；`rm##`/`xm##`/未知音先录不震，可在 GUI 单独启用**。
-
-已知跳过规则：`vm*` bank 作为人物语音跳过；`sm##.fsb` 这种 `sm` 后跟数字的 bank 作为地图 BGM 跳过。`smain*.fsb` 不算 BGM，会作为通用音效参与触觉。
-
-GUI 里的「音效管理」可以配置触觉规则：勾选启用/禁用、修改强度、打开录音后点「保存配置」。配置在只狼启动时读取；游戏已经运行时，请重启只狼后生效。
-
-录音有两种方式：「录遇到的所有音效」会录制本局遇到的所有 SFX Channel，但仍然跳过音乐/语音；单行「录音」只录对应分组。同一分组只保留最新一个 WAV。
-
-配置和运行时数据保存在：
+当前稳定策略是：
 
 ```text
-%APPDATA%\DualSenseSfxHaptics\haptics.json          # 触觉规则、强度、录音开关
-%APPDATA%\DualSenseSfxHaptics\seen_effects.jsonl    # 游戏运行中发现过的音效
-%APPDATA%\DualSenseSfxHaptics\dumps\                # 按 idx 导出的试听 WAV
+vm*              -> 语音，不震
+sm##.fsb         -> 地图 BGM，不震
+smain*/main      -> 通用动作/战斗 SFX，默认震
+(unknown)        -> 只对旧实测确认的 idx 兜底震
+rm##/xm##        -> 默认只录不震，可在 GUI 单独启用
 ```
 
----
+配置不再热更新。GUI 保存配置后，需要重启只狼才会让 DLL 重新读取配置。
 
-## 🧩 工作原理（简）
+## 改进总览
 
-游戏目录里有真正的 `fmodex64.dll`。本工具放一个**同名代理 DLL**：把 700+ 个导出原样转发给真引擎（游戏无感），
-只拦几个关键函数，用 `getSubSound` 记录**每个声音在 bank 里的编号**，playSound 时反查 →
-排除 `vm*` 语音和 `sm##` 音乐后，对 `smain*` 等稳定音效给 FMOD Channel 挂一个透传 DSP，复制该 Channel 的 PCM 音频送到 DualSense 的 ch3/4 触觉音圈或虚拟声卡。GUI 配置仍可按 idx 单独启用、禁用或调强度。
-**不解密、不分离、不改游戏行为，纯只读观测 + 触觉输出。**
+| 阶段 | 原状态 / 问题 | 改进 | 主要位置 |
+| --- | --- | --- | --- |
+| 1. FMOD 代理 | 原项目偏 GUI/原型，无法稳定知道游戏播放了什么 | 做 `fmodex64.dll` 代理，转发原 DLL 导出，只拦关键 FMOD 函数 | [src/native/fmod_probe/dllmain.cpp](src/native/fmod_probe/dllmain.cpp), [src/native/fmod_probe/thunks.asm](src/native/fmod_probe/thunks.asm) |
+| 2. bank 分类 | 只知道有声音，不知道来自音乐、语音还是音效 | 记录 `Sound* -> bank`，用文件名规则区分 `vm*` 和 `sm##` | `classify`, `createSound*_detour` |
+| 3. idx 识别 | `playSound` 拿到子声音时不知道它是 FSB 里的第几个 | hook `getSubSound`，记录 `subSound* -> idx` 和 `subSound* -> parent bank` | `getSubSoundCpp_detour`, `getSubSoundC_detour` |
+| 4. 触觉来源 | 早期使用 master 混音门控，声音不纯 | 改成在当前 `Channel*` 上挂透明 DSP | `playSound_detour`, `attach_channel_tap`, `channel_tap_read` |
+| 5. WAV 导出 | 只能感受震动，不能听单个音效 | DSP 回调中把 Channel PCM 写成 WAV | `create_channel_dump`, `write_channel_dump` |
+| 6. GUI 配置 | 改参数要重新编译或手改 JSON | WinForms GUI 管理安装、录音、idx、强度和启用状态 | [src/gui/MainForm.cs](src/gui/MainForm.cs) |
+| 7. 录音模式 | 只能录启用触觉的声音 | 全局录音可录遇到的 SFX，但未启用的声音不震 | `decide_haptic`, `channel_tap_read` |
+| 8. 分类整理 | dumps 里全是平铺 WAV，不好查 | 根据 `seen_effects.jsonl` 把 WAV 复制到 `dumps_by_fsb` | AppData 运行数据 |
+| 9. 策略收敛 | “非对白/音乐全震”实际太乱 | 改为稳定默认：`smain*` 和确认 idx 震，`rm/xm` 先录不震 | `decide_haptic`, GUI 默认项 |
 
-技术细节与研发历程见 [`PROJECT_CHANGES.md`](PROJECT_CHANGES.md)。
+## 原始问题
 
----
+普通 DSX Audio-to-Haptics 会把系统里所有声音都转成触觉。对只狼来说，这会导致：
 
-## 🛠️ 从源码自编译（开发者）
+- BGM 一直在震。
+- 人物对白也震。
+- 音效、音乐、环境音混在一起，无法针对战斗动作调手感。
 
-**环境**：Windows 10/11 x64、Visual Studio 2022 Build Tools（含 C++/MASM）、CMake、.NET 8 SDK。
+最初的目标是只让“该震的音效”进入触觉链路，尤其是弹刀、受击、处决、危攻这类瞬态声音。
 
-```bash
-# 1) 编译代理 DLL
-cmake -S src/native/fmod_probe -B build -A x64
-cmake --build build --config Release      # 产物 build/Release/fmodex64.dll
+后来目标进一步扩展：不仅要震，还要能把 FMOD 内部某个音效单独录成 WAV，方便人工听、分类和标注。
 
-# 2) 编译 GUI（会自动打包上面的代理 DLL）
-dotnet build src/gui/DualSenseHaptics.csproj -c Release
+## 总体音频流转
 
-# 或发布自包含单文件（别人不用装 .NET）
-dotnet publish src/gui/DualSenseHaptics.csproj -c Release -r win-x64 \
-    --self-contained true -p:PublishSingleFile=true
+```text
+游戏 .fsb/.fev 资源
+        |
+        | createSound / createStream / createSoundInternal
+        v
+FMOD Sound*
+        |
+        | getSubSound(index)
+        v
+FMOD 子 Sound*
+        |        记录：子 Sound* -> idx
+        |        记录：子 Sound* -> parent bank
+        |
+        | playSound(sound)
+        v
+FMOD Channel*        <- 本次播放的一路声音
+        |
+        | FMOD_Channel_AddDSP(channel, dsp)
+        v
+透明 Channel DSP
+        |
+        | in  = 当前 Channel PCM
+        | out = 原样传回 FMOD
+        |
+        +---- 写 WAV 到 dumps
+        |
+        +---- push_audio_to_ring -> haptic_out.cpp -> DualSense / VB-CABLE
+        |
+        v
+FMOD master 混音 -> 游戏正常声音输出
 ```
 
----
+核心区别：
 
-## 📋 系统要求
+```text
+早期：从 master 总混音里开门取声音。
+现在：在当前 FMOD Channel 上复制单路 PCM。
+```
 
-- Windows 10 / 11（x64）
-- PC 版《只狼：影逝二度》（Steam）
-- Sony DualSense 手柄（**USB 有线**）
-- Steam Input（把手柄当 Xbox 用）
-- 可选：VB-CABLE + DSX（走虚拟声卡那条路时）
+## 关键代码链路
 
----
+### 1. 记录 Sound 属于哪个 FSB
 
-## 📝 协议
+入口：
 
-MIT License。仅供个人使用：只读观察单机游戏音频，不修改存档、不联机、不规避反作弊。
-《只狼：影逝二度》及其素材版权归 FromSoftware / Activision 所有；本仓库**不含任何游戏文件**。
+```cpp
+createSound_detour(...)
+createStream_detour(...)
+createSoundInternal_detour(...)
+```
 
----
+做法：
 
-**当前版本**：0.1（GUI 成品化：一键安装/状态/输出切换）
+```cpp
+std::string base = basename_ascii(nameOrData);
+g_soundBank[*sound] = base;
+```
+
+得到映射：
+
+```text
+Sound* -> smain_jaj.fsb
+Sound* -> sm11.fsb
+Sound* -> vm11_jaj.fsb
+```
+
+这一步用于后续判断音乐、语音和音效。
+
+### 2. 记录子声音 idx 和父 bank
+
+入口：
+
+```cpp
+getSubSoundCpp_detour(...)
+getSubSoundC_detour(...)
+```
+
+做法：
+
+```cpp
+g_subIndex[*subsound] = index;
+g_subBank[*subsound] = it->second;
+```
+
+得到映射：
+
+```text
+子 Sound* -> idx
+子 Sound* -> FSB bank
+```
+
+这一步解决了 `playSound` 播放子声音时“不知道这是 FSB 里第几个声音”的问题。
+
+### 3. 在 playSound 中拿到 Channel
+
+入口：
+
+```cpp
+playSound_detour(...)
+```
+
+先查询：
+
+```cpp
+std::string bank = lookup_bank(sound);
+int subIdx = ... g_subIndex.find(sound) ...;
+HapticDecision haptic = decide_haptic(subIdx, bank, verdict[0] == 'V');
+```
+
+再调用原 FMOD：
+
+```cpp
+FMOD_RESULT r = g_playSound(self, channelid, sound, playPaused, channel);
+```
+
+这里 `channel` 是 FMOD 为这次播放创建出来的一路声音。后面的单独 WAV 和触觉都从这个 Channel 来。
+
+### 4. 给 Channel 挂透明 DSP
+
+入口：
+
+```cpp
+attach_channel_tap(self, *channel, subIdx, haptic.gain, haptic.dump, shouldHaptic)
+```
+
+创建 DSP：
+
+```cpp
+FMOD_DSP_DESCRIPTION_ d{};
+d.read = channel_tap_read;
+d.release = channel_tap_release;
+g_createDSP(system, &d, &dsp);
+```
+
+挂到当前 Channel：
+
+```cpp
+g_chAddDSP(channel, dsp, &conn);
+```
+
+这是从 master 捕获升级到 Channel 捕获的核心改动。
+
+### 5. DSP 回调中写 WAV 和送触觉
+
+入口：
+
+```cpp
+channel_tap_read(..., float* in, float* out, unsigned int length, int inch, int outch)
+```
+
+先透传，保证游戏声音不变：
+
+```cpp
+memcpy(out, in, (size_t)length * ch * sizeof(float));
+```
+
+如果需要录音：
+
+```cpp
+state->plugindata = ctx.dump ? create_channel_dump(ctx.idx, ch) : nullptr;
+write_channel_dump((ChannelDump*)state->plugindata, in, length, inch);
+```
+
+如果需要触觉：
+
+```cpp
+push_audio_to_ring(in, length, inch, true, ctx.gain);
+```
+
+也就是说同一份 Channel PCM 分成两路：
+
+```text
+Channel PCM -> WAV 文件
+Channel PCM -> haptic ring -> WASAPI -> DualSense / VB-CABLE
+```
+
+## WAV 导出实现
+
+WAV 文件创建在：
+
+```cpp
+create_channel_dump(int idx, int channels)
+```
+
+文件名规则：
+
+```cpp
+const char* key = sound_group_key(idx);
+if (key) file = key + ".wav";
+else     file = "idx%d.wav";
+```
+
+例子：
+
+```text
+deathblow_break.wav
+deflect_guard.wav
+hurt_death.wav
+idx459.wav
+```
+
+写入在：
+
+```cpp
+write_channel_dump(ChannelDump* dump, const float* in, unsigned int length, int inch)
+```
+
+实现方式：
+
+- 输入是 FMOD 的 float PCM。
+- 写文件前转为 16-bit PCM。
+- 每次写入后更新 WAV header。
+- 单个 dump 默认最多保留约 3 秒，避免长音无限写文件。
+- 同一分组只保留最新一个 WAV。
+
+写 WAV header 的函数是：
+
+```cpp
+wav_write_header(FILE* f, int channels, int frames)
+```
+
+这样即使 FMOD 没有及时调用 release，文件也基本能直接播放。
+
+## 触觉输出实现
+
+触觉输出在 [src/native/fmod_probe/haptic_out.cpp](src/native/fmod_probe/haptic_out.cpp)。
+
+流程：
+
+```text
+channel_tap_read
+  -> push_audio_to_ring
+  -> haptic_pull_audio
+  -> WASAPI render thread
+  -> DualSense ch3/ch4 或 CABLE Input
+```
+
+两种输出目标：
+
+- DualSense ch3/ch4 直驱。
+- VB-CABLE，再由 DSX Audio-to-Haptics 转成手柄触觉。
+
+实际手感上，DSX 路线更适合高频金属声，因为它会做包络提取和低频合成。
+
+## 过滤策略的改动
+
+### 第一版：文件名前缀过滤
+
+只按 bank 名判断：
+
+```text
+vm*      -> 语音，跳过
+sm##     -> 音乐，跳过
+其它     -> 音效候选
+```
+
+实现位置：
+
+```cpp
+classify(const std::string& base)
+```
+
+这个规则能正确排除语音和 BGM，但“其它全部震”会把区域音、脚步和杂项也带进来。
+
+### 第二版：idx 白名单
+
+为了减少乱震，加入 `is_haptic_event(idx)`：
+
+```text
+665-700   -> 弹刀/格挡
+408       -> 危攻蓄力
+983-992   -> 受伤/死亡
+851-853   -> 处决/破防
+256-258   -> 闪避/剧烈移动
+...
+```
+
+这个版本很稳，但覆盖范围偏窄。
+
+### 第三版：非对白/音乐全震
+
+根据“只要对白 + 音乐不震，其余一律震”的需求，尝试过：
+
+```text
+vm* 和 sm## 跳过，其余默认震
+```
+
+实际结果是震动更乱，因为 `rm##`、`xm##`、大量 `(unknown)` 会包含脚步、区域环境、杂项事件。
+
+### 当前稳定版
+
+现在的默认策略在：
+
+```cpp
+decide_haptic(int idx, const std::string& bank, bool bankAllowsHaptics)
+```
+
+核心判断：
+
+```cpp
+bool enabled = g_cfg.useBuiltinDefaults &&
+    (is_default_haptic_bank(bank) || (bank == "(unknown)" && is_haptic_event(idx)));
+```
+
+含义：
+
+```text
+smain*/main  -> 默认震
+(unknown)    -> 只有旧实测确认 idx 才震
+rm##/xm##    -> 默认只录不震，GUI 可手动启用
+vm*/sm##     -> 跳过
+```
+
+## 配置系统改动
+
+配置文件：
+
+```text
+%APPDATA%\DualSenseSfxHaptics\haptics.json
+```
+
+主要字段：
+
+```json
+{
+  "enabled": true,
+  "defaultGain": 1.0,
+  "dumpEnabled": false,
+  "useBuiltinDefaults": true,
+  "effects": {
+    "853": { "enabled": true, "gain": 2.5, "dump": true, "name": "deathblow" }
+  }
+}
+```
+
+规则：
+
+- `enabled` 是全局触觉开关。
+- `defaultGain` 是默认强度。
+- `dumpEnabled` 表示录遇到的所有 SFX Channel。
+- `useBuiltinDefaults` 表示使用当前稳定默认策略。
+- `effects` 可按 idx 覆盖启用状态、强度、录音和名称。
+
+曾经实现过运行时热更新，但实际体验不稳定，已经移除。现在 DLL 每个只狼进程只读取一次配置，保存后需要重启游戏生效。
+
+相关函数：
+
+```cpp
+load_config_once
+parse_config
+decide_haptic
+```
+
+## GUI 改动
+
+GUI 在 [src/gui/MainForm.cs](src/gui/MainForm.cs)。
+
+从原来的安装/输出控制面板，扩展为：
+
+- 选择游戏目录。
+- 安装/卸载代理 DLL。
+- 选择 DualSense 直驱或 VB-CABLE/DSX 输出。
+- 读取 `seen_effects.jsonl`，列出已发现 idx。
+- 按 idx 启用/禁用触觉。
+- 调整单个 idx 的 gain。
+- 勾选单个 idx 或全局录音。
+- 试听已录 WAV。
+- 打开录音目录。
+
+GUI 保存配置时会先提交 DataGridView 当前编辑，避免“刚勾选但没离开格子，所以没保存”的问题。
+
+## 运行时发现记录
+
+发现记录文件：
+
+```text
+%APPDATA%\DualSenseSfxHaptics\seen_effects.jsonl
+```
+
+写入函数：
+
+```cpp
+record_seen_effect
+```
+
+每行大致包含：
+
+```json
+{
+  "time": "2026-07-04 05:12:43",
+  "idx": 57,
+  "bank": "smain_jaj.fsb",
+  "sub": "",
+  "verdict": "VIBRATE",
+  "meaning": "死亡屏幕",
+  "haptic": true,
+  "gain": 1.0
+}
+```
+
+这个文件用于：
+
+- GUI 展示已发现 idx。
+- 以后把 WAV 按 FSB 分类。
+- 分析哪些 bank 是语音、音乐、音效。
+
+## 录音分类整理
+
+原始录音目录：
+
+```text
+%APPDATA%\DualSenseSfxHaptics\dumps
+```
+
+按 FSB 整理后的目录：
+
+```text
+%APPDATA%\DualSenseSfxHaptics\dumps_by_fsb
+```
+
+整理方法：
+
+1. 读取 `seen_effects.jsonl`。
+2. 建立 `idx -> bank` 的投票映射。
+3. 扫描 `dumps/*.wav`。
+4. 从文件名解析 idx 或分组名。
+5. 按 bank 复制到 `dumps_by_fsb/<bank>/`。
+6. 生成 `manifest_all.tsv` 和每个 bank 的 `.tsv` 清单。
+
+注意：早期录音里很多 `idx` 还没有准确父 bank，所以会进入 `unknown_fsb`。新版 DLL 已经记录 `subSound* -> parent bank`，后续新录音会更容易分到具体 FSB。
+
+## 游戏资源分析结论
+
+对 `D:\SteamLibrary\steamapps\common\Sekiro\sound` 的离线扫描结果：
+
+- `.fev` 是 RIFF/FEV，包含可读路径，比如 `/rm11/p110100100` 和 `bank/ntc_rm11/*.wav`。
+- `smain*.fsb` 不是普通明文 FSB5 头，直接扫字符串拿不到可靠样本名。
+- `sm##.fsb` 对应地图 BGM。
+- `vm##*.fsb` 对应语音，有 `_enu/_jaj/_ded` 等语言后缀。
+- `rm##.fsb` 更像区域/通知/环境类资源。
+- `xm##.fsb` 属于额外事件/地图类候选，默认不震，先录后人工判断。
+- 当前 sound 目录没有发现 `c####.fsb`。
+
+因此官方可读名字无法从 `smain*.fsb` 直接稳定恢复，目前主要靠运行时 idx、WAV 试听和人工标注。
+
+## 构建与部署
+
+Native DLL 构建命令：
+
+```powershell
+& "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" --build build --config Release
+```
+
+GUI 构建命令：
+
+```powershell
+& "C:\Program Files\dotnet\dotnet.exe" build "src\gui\DualSenseHaptics.csproj" -c Release
+```
+
+当前 native 工程需要 MSVC `/utf-8`，否则中文注释在部分系统代码页下可能导致编译解析异常。这个配置在 [src/native/fmod_probe/CMakeLists.txt](src/native/fmod_probe/CMakeLists.txt)。
+
+安装方式：
+
+1. 游戏原始 `fmodex64.dll` 备份为 `fmodex64_orig.dll`。
+2. 编译出的代理 DLL 放到游戏目录，文件名仍为 `fmodex64.dll`。
+3. 只狼启动时加载代理 DLL。
+4. 代理 DLL 再加载 `fmodex64_orig.dll` 并转发绝大多数导出。
+
+GUI 的“安装到游戏”按钮会自动做这个过程。
+
+## 重要运行文件
+
+```text
+%TEMP%\fmod_probe_log.txt                         # FMOD hook 日志
+%TEMP%\haptic_out_log.txt                         # WASAPI/触觉输出日志
+%APPDATA%\DualSenseSfxHaptics\haptics.json        # 触觉配置
+%APPDATA%\DualSenseSfxHaptics\seen_effects.jsonl  # 已发现 idx/bank 记录
+%APPDATA%\DualSenseSfxHaptics\dumps\              # 原始 WAV 录音
+%APPDATA%\DualSenseSfxHaptics\dumps_by_fsb\       # 按 FSB 分类后的 WAV
+```
+
+## 验证方法
+
+### 验证 Channel DSP 是否生效
+
+查看 `%TEMP%\fmod_probe_log.txt`，应看到类似：
+
+```text
+PLAY ... bank=smain_jaj.fsb ... idx=57 ... dump=1
+CHDSP: attached channel=... idx=57 gain=1.00 dump=1 haptic=1
+CHDSP first read: in=... out=... length=... inch=...
+CHDUMP: open ... death_screen.wav
+```
+
+### 验证不是 master 混音
+
+关键证据是日志里有：
+
+```text
+CHDSP: attached channel=...
+```
+
+这表示 DSP 挂在本次播放的 FMOD Channel 上，而不是只靠 master fallback。
+
+### 验证配置是否生效
+
+因为配置是进程启动时读取，修改 GUI 后需要：
+
+1. 保存配置。
+2. 关闭只狼。
+3. 重新启动只狼。
+4. 查看日志里的 `CFG: loaded ...`。
+
+## 当前已知限制
+
+- 早期录制文件很多属于 `unknown_fsb`，因为当时还没有完整记录子声音父 bank。
+- `smain*.fsb` 无法直接通过字符串扫描恢复官方样本名。
+- `rm##/xm##` 默认不震，是为了避免乱震；需要通过录音试听后手动启用。
+- GUI 仍然是调试工具形态，适合标注和调参，不是最终发行 UI。
+- 配置不热更新，改完要重启游戏。
+
+## 后续可改进方向
+
+- 把 `dumps_by_fsb` 分类脚本固化进 GUI。
+- 给 GUI 增加“按 bank 过滤”和“批量启用/禁用”。
+- 给每个 idx 增加人工备注字段和导出表。
+- 在新版本 DLL 下重新录一轮，减少 `unknown_fsb`。
+- 继续补充 `sound_meaning(idx)` 的人工标注。
+- 针对不同输出路线提供不同默认 gain，例如 DSX 路线和直驱路线分开调。
+
+## 文件索引
+
+- [src/native/fmod_probe/dllmain.cpp](src/native/fmod_probe/dllmain.cpp)：FMOD 代理、bank/idx 记录、Channel DSP、WAV dump、配置判断。
+- [src/native/fmod_probe/haptic_out.cpp](src/native/fmod_probe/haptic_out.cpp)：WASAPI 触觉输出，目标设备选择。
+- [src/gui/MainForm.cs](src/gui/MainForm.cs)：WinForms GUI，安装、输出选择、音效管理、试听。
+- [src/gui/DualSenseHaptics.csproj](src/gui/DualSenseHaptics.csproj)：GUI 构建和 proxy DLL 打包。
+- [haptics.example.json](haptics.example.json)：配置文件示例。
+- [PROJECT_CHANGES.md](PROJECT_CHANGES.md)：更早期的研发记录和实验日志。
