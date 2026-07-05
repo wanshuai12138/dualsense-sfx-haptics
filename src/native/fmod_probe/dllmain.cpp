@@ -26,6 +26,9 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
+#include <deque>
+#include <utility>
 #include <mutex>
 #include <atomic>
 #include <cstdarg>
@@ -142,6 +145,10 @@ static bool is_haptic_event(int idx) {
     return false;
 }
 
+static bool is_speaker_event(int idx) {
+    return idx >= 697 && idx <= 699; // 弹刀主金属层；伴随层留给触觉，避免喇叭多层叠爆
+}
+
 // ----------------------------------------------------------------------------
 static const char* basename_ascii(const char* path) {
     if (!path) return "";
@@ -193,6 +200,7 @@ struct HapticConfig {
     bool enabled = true;
     bool dumpEnabled = true;
     bool useBuiltinDefaults = false;
+    bool speakerEnabled = true;
     float defaultGain = 1.0f;
     std::unordered_map<int, EffectRule> effects;
 };
@@ -201,8 +209,39 @@ struct HapticDecision {
     bool enabled = false;
     bool dump = false;
     bool attach = false;
+    bool speaker = false;
+    bool speakerSuppressed = false;
     float gain = 1.0f;
 };
+
+static int speaker_priority_for_idx(int idx) {
+    if (idx == 699) return 100;
+    if (idx == 698) return 95;
+    if (idx == 697) return 90;
+    return 0;
+}
+
+static bool claim_speaker_event(int idx) {
+    if (!is_speaker_event(idx)) return false;
+
+    static std::mutex speakerClaimLock;
+    static ULONGLONG claimTick = 0;
+    static int claimPriority = 0;
+    static int claimIdx = -1;
+    const ULONGLONG now = GetTickCount64();
+    const int priority = speaker_priority_for_idx(idx);
+
+    std::lock_guard<std::mutex> lock(speakerClaimLock);
+    if (now - claimTick > 180) {
+        claimTick = now;
+        claimPriority = priority;
+        claimIdx = idx;
+        return true;
+    }
+    logf("SPEAKER: suppress idx=%d by idx=%d dt=%llums pri=%d/%d", idx, claimIdx,
+         (unsigned long long)(now - claimTick), priority, claimPriority);
+    return false;
+}
 
 static std::once_flag g_appPathOnce;
 static char g_appDir[MAX_PATH] = "";
@@ -260,6 +299,7 @@ static void write_default_config_if_missing() {
         "  \"defaultGain\": 1.0,\n"
         "  \"dumpEnabled\": true,\n"
         "  \"useBuiltinDefaults\": false,\n"
+        "  \"speakerEnabled\": true,\n"
         "  \"effects\": {}\n"
         "}\n";
     fwrite(text, 1, strlen(text), f);
@@ -313,6 +353,7 @@ static HapticConfig parse_config(const std::string& text) {
     if (find_json_bool(root, "enabled", &b)) cfg.enabled = b;
     if (find_json_bool(root, "dumpEnabled", &b)) cfg.dumpEnabled = b;
     if (find_json_bool(root, "useBuiltinDefaults", &b)) cfg.useBuiltinDefaults = b;
+    if (find_json_bool(root, "speakerEnabled", &b)) cfg.speakerEnabled = b;
     if (find_json_float(root, "defaultGain", &f)) cfg.defaultGain = clamp_gain(f);
 
     if (effectsPos == std::string::npos) return cfg;
@@ -365,7 +406,8 @@ static void load_config_once() {
             g_cfg = cfg;
         }
         logf("CFG: loaded %s enabled=%d defaultGain=%.2f dump=%d effects=%zu",
-             g_cfgPath, cfg.enabled ? 1 : 0, cfg.defaultGain, cfg.dumpEnabled ? 1 : 0, cfg.effects.size());
+               g_cfgPath, cfg.enabled ? 1 : 0, cfg.defaultGain, cfg.dumpEnabled ? 1 : 0, cfg.effects.size());
+           logf("CFG: speaker enabled=%d", cfg.speakerEnabled ? 1 : 0);
     });
 }
 
@@ -376,6 +418,8 @@ static HapticDecision decide_haptic(int idx, const std::string& bank, bool bankA
     std::lock_guard<std::mutex> lock(g_cfgLock);
     if (!g_cfg.enabled) return d;
     bool enabled = g_cfg.useBuiltinDefaults && (is_default_haptic_bank(bank) || (bank == "(unknown)" && is_haptic_event(idx)));
+    bool speakerCandidate = g_cfg.speakerEnabled && is_speaker_event(idx);
+    bool speaker = speakerCandidate && claim_speaker_event(idx);
     float gain = g_cfg.defaultGain;
     bool dump = g_cfg.dumpEnabled;
     auto it = idx >= 0 ? g_cfg.effects.find(idx) : g_cfg.effects.end();
@@ -388,7 +432,9 @@ static HapticDecision decide_haptic(int idx, const std::string& bank, bool bankA
     d.enabled = enabled;
     d.gain = clamp_gain(gain);
     d.dump = dump;
-    d.attach = enabled || dump;
+    d.speaker = speaker;
+    d.speakerSuppressed = speakerCandidate && !speaker;
+    d.attach = enabled || dump || speaker;
     return d;
 }
 
@@ -509,7 +555,9 @@ typedef struct FMOD_DSP_DESCRIPTION_ {
 typedef FMOD_RESULT (*CreateCG_t)(void*, const char*, void**);
 typedef FMOD_RESULT (*CreateDSP_t)(void*, const FMOD_DSP_DESCRIPTION_*, void**);
 typedef FMOD_RESULT (*AddDSP_t)(void*, void*, void**);
+typedef FMOD_RESULT (*AddGroup_t)(void*, void*);
 typedef FMOD_RESULT (*SetCG_t)(void*, void*);
+typedef FMOD_RESULT (*GetCG_t)(void*, void**);
 typedef FMOD_RESULT (*GetMaster_t)(void*, void**);
 typedef FMOD_RESULT (*ChannelAddDSP_t)(void*, void*, void**);
 typedef FMOD_RESULT (*ChannelSetPaused_t)(void*, int);
@@ -521,7 +569,10 @@ typedef FMOD_RESULT (*ChannelSet3DAttributes_t)(void*, const FMOD_VECTOR_*, cons
 static CreateCG_t  g_createCG  = nullptr;
 static CreateDSP_t g_createDSP = nullptr;
 static AddDSP_t    g_addDSP    = nullptr;
+static AddGroup_t  g_addGroup  = nullptr;
 static SetCG_t     g_setCG     = nullptr;
+static SetCG_t     g_setCGCpp  = nullptr;
+static GetCG_t     g_getCG     = nullptr;
 static GetMaster_t g_getMaster = nullptr;
 static ChannelAddDSP_t   g_chAddDSP    = nullptr;
 static ChannelSetPaused_t g_chSetPaused = nullptr;
@@ -552,10 +603,30 @@ static void enum_groups(void* grp, int depth) {
 // WASAPI 线程按时间顺序拉取并清空。这样多个音效同时触发时会混合，而不是排队串起来。
 static const unsigned RING = 16384, RMASK = RING - 1;
 static const unsigned MIX_LATENCY_FRAMES = 512; // ~10.7ms@48k，给多个 DSP 回调一个对齐窗口
-static float g_ringL[RING], g_ringR[RING];             // 已确认音效的直接混音
-static float g_ringGatedL[RING], g_ringGatedR[RING];   // master fallback 的门控混音
+static const unsigned SPEAKER_PREFILL_FRAMES = 1024; // ~21ms@48k，喇叭先留一点安全延迟，多个 Channel 按时间轴混合
+static float g_ringL[RING], g_ringR[RING];             // 已确认音效的直接触觉混音
+static float g_ringGatedL[RING], g_ringGatedR[RING];   // master fallback 的门控触觉混音
+static float g_speakerRingL[RING], g_speakerRingR[RING]; // 手柄喇叭原始 PCM 直通(ch1/ch2)
 static std::atomic<unsigned> g_wr{0}, g_rd{0};
+static std::atomic<unsigned> g_speakerWr{0}, g_speakerRd{0};
+static bool g_speakerPrimed = false;
+static std::atomic<unsigned> g_speakerPushBlocks{0};
+static std::atomic<unsigned> g_speakerPushFrames{0};
+static std::atomic<unsigned> g_speakerUnderflows{0};
 static std::mutex g_ringLock;
+
+struct SpeakerClipItem {
+    int idx = -1;
+    std::vector<float> left;
+    std::vector<float> right;
+    unsigned pos = 0;
+};
+
+static std::mutex g_speakerClipLock;
+static std::deque<SpeakerClipItem> g_speakerClipQueue;
+static bool g_speakerClipStarted = false;
+static const size_t SPEAKER_QUEUE_MAX_CLIPS = 256;
+static const unsigned SPEAKER_QUEUE_PREFILL_FRAMES = 1024;
 
 // 门控：音效播放时打开(=1)，之后逐采样衰减。haptic 输出 = master音频 × 门。
 static std::atomic<float> g_gate{0.0f};
@@ -631,14 +702,23 @@ static SpatialState get_spatial(void* channel) {
     return it != g_channelSpatial.end() ? it->second : default_spatial();
 }
 
-static inline void clear_mix_slot(unsigned pos) {
+static inline void clear_haptic_slot(unsigned pos) {
     unsigned p = pos & RMASK;
     g_ringL[p] = g_ringR[p] = 0.0f;
     g_ringGatedL[p] = g_ringGatedR[p] = 0.0f;
 }
 
-static void clear_mix_range(unsigned begin, unsigned end) {
-    for (unsigned p = begin; p < end; ++p) clear_mix_slot(p);
+static inline void clear_speaker_slot(unsigned pos) {
+    unsigned p = pos & RMASK;
+    g_speakerRingL[p] = g_speakerRingR[p] = 0.0f;
+}
+
+static void clear_haptic_range(unsigned begin, unsigned end) {
+    for (unsigned p = begin; p < end; ++p) clear_haptic_slot(p);
+}
+
+static void clear_speaker_range(unsigned begin, unsigned end) {
+    for (unsigned p = begin; p < end; ++p) clear_speaker_slot(p);
 }
 
 static float soft_limit(float x) {
@@ -674,7 +754,7 @@ static float push_audio_to_ring(const float* in, unsigned int length, int inch, 
 
     unsigned start = *sourceCursor;
     unsigned end = start + frames;
-    if (end > wr) clear_mix_range(wr, end);
+    if (end > wr) clear_haptic_range(wr, end);
 
     float* dstL = direct ? g_ringL : g_ringGatedL;
     float* dstR = direct ? g_ringR : g_ringGatedR;
@@ -712,6 +792,178 @@ static float push_mono_to_ring(const float* mono, unsigned int length, bool dire
     return push_audio_to_ring(mono, length, 1, direct, gain, sourceCursor, sourceStarted, leftGain, rightGain);
 }
 
+static float push_speaker_to_ring(const float* in, unsigned int length, int inch,
+                                  unsigned* sourceCursor, bool* sourceStarted) {
+    if (!in || length == 0 || inch <= 0 || inch > 32) return 0.0f;
+    std::lock_guard<std::mutex> lock(g_ringLock);
+    static unsigned fallbackCursor = 0;
+    static bool fallbackStarted = false;
+    if (!sourceCursor) sourceCursor = &fallbackCursor;
+    if (!sourceStarted) sourceStarted = &fallbackStarted;
+
+    unsigned frames = length;
+    if (frames > RING / 2) frames = RING / 2;
+    unsigned wr = g_speakerWr.load(std::memory_order_relaxed);
+    unsigned rd = g_speakerRd.load(std::memory_order_relaxed);
+
+    unsigned anchor = rd + SPEAKER_PREFILL_FRAMES;
+    if (!*sourceStarted || *sourceCursor < anchor) {
+        *sourceCursor = anchor;
+        *sourceStarted = true;
+    }
+    unsigned maxStart = rd + RING - frames - 1;
+    if (*sourceCursor > maxStart) *sourceCursor = maxStart;
+
+    unsigned start = *sourceCursor;
+    unsigned end = start + frames;
+    if (end > wr) clear_speaker_range(wr, end);
+
+    float peak = 0.0f;
+    for (unsigned int i = 0; i < frames; ++i) {
+        float l = 0.0f, r = 0.0f;
+        if (inch >= 2) {
+            l = in[i * inch];
+            r = in[i * inch + 1];
+        } else {
+            l = r = in[i * inch];
+        }
+        unsigned pos = (start + i) & RMASK;
+        if (fabsf(g_speakerRingL[pos]) < 0.0001f && fabsf(g_speakerRingR[pos]) < 0.0001f) {
+            g_speakerRingL[pos] = l;
+            g_speakerRingR[pos] = r;
+        }
+        float a = fabsf(l); if (fabsf(r) > a) a = fabsf(r); if (a > peak) peak = a;
+    }
+    *sourceCursor = end;
+    if (end > wr) g_speakerWr.store(end, std::memory_order_release);
+    g_speakerPushBlocks.fetch_add(1, std::memory_order_relaxed);
+    g_speakerPushFrames.fetch_add(frames, std::memory_order_relaxed);
+    return peak;
+}
+
+static unsigned speaker_queue_frames_locked() {
+    unsigned total = 0;
+    for (const SpeakerClipItem& item : g_speakerClipQueue) {
+        unsigned size = (unsigned)item.left.size();
+        if (item.pos < size) total += size - item.pos;
+    }
+    return total;
+}
+
+static void reset_speaker_stream_queue(int idx) {
+    unsigned cleared = 0;
+    size_t clips = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_speakerClipLock);
+        cleared = speaker_queue_frames_locked();
+        clips = g_speakerClipQueue.size();
+        g_speakerClipQueue.clear();
+        g_speakerClipStarted = false;
+    }
+    if (cleared > 0) logf("SPEAKER: reset stream idx=%d clearedFrames=%u clips=%zu", idx, cleared, clips);
+}
+
+static float enqueue_speaker_clip_to_ring(const float* left, const float* right, unsigned frames, int idx) {
+    if (!left || !right || frames == 0) return 0.0f;
+    float peak = 0.0f;
+    for (unsigned i = 0; i < frames; ++i) {
+        float l = left[i];
+        float r = right[i];
+        float a = fabsf(l); if (fabsf(r) > a) a = fabsf(r); if (a > peak) peak = a;
+    }
+
+    SpeakerClipItem item;
+    item.idx = idx;
+    item.left.assign(left, left + frames);
+    item.right.assign(right, right + frames);
+
+    unsigned backlog = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_speakerClipLock);
+        backlog = speaker_queue_frames_locked();
+        while (g_speakerClipQueue.size() >= SPEAKER_QUEUE_MAX_CLIPS) g_speakerClipQueue.pop_front();
+        g_speakerClipQueue.push_back(std::move(item));
+    }
+    g_speakerPushBlocks.fetch_add(1, std::memory_order_relaxed);
+    g_speakerPushFrames.fetch_add(frames, std::memory_order_relaxed);
+    logf("SPEAKER: enqueue clip-player idx=%d frames=%u peak=%.4f backlog=%u", idx, frames, peak, backlog);
+    return peak;
+}
+
+static float enqueue_speaker_block(const float* in, unsigned int length, int inch, int idx) {
+    if (!in || length == 0 || inch <= 0 || inch > 32) return 0.0f;
+    SpeakerClipItem item;
+    item.idx = idx;
+    item.left.resize(length);
+    item.right.resize(length);
+    float peak = 0.0f;
+    for (unsigned i = 0; i < length; ++i) {
+        float l = 0.0f, r = 0.0f;
+        if (inch >= 2) {
+            l = in[i * inch];
+            r = in[i * inch + 1];
+        } else {
+            l = r = in[i * inch];
+        }
+        item.left[i] = l;
+        item.right[i] = r;
+        float a = fabsf(l); if (fabsf(r) > a) a = fabsf(r); if (a > peak) peak = a;
+    }
+
+    unsigned backlog = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_speakerClipLock);
+        backlog = speaker_queue_frames_locked();
+        while (g_speakerClipQueue.size() >= SPEAKER_QUEUE_MAX_CLIPS) g_speakerClipQueue.pop_front();
+        g_speakerClipQueue.push_back(std::move(item));
+    }
+    g_speakerPushBlocks.fetch_add(1, std::memory_order_relaxed);
+    g_speakerPushFrames.fetch_add(length, std::memory_order_relaxed);
+    static std::atomic<unsigned> blockLog{0};
+    if (blockLog.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {
+        logf("SPEAKER: stream block idx=%d frames=%u peak=%.4f backlog=%u", idx, length, peak, backlog);
+    }
+    return peak;
+}
+
+static int pull_speaker_clip_queue(float* speakerL, float* speakerR, int n, float* outPeak, unsigned* outAvail) {
+    if (!speakerL || !speakerR || n <= 0) return 0;
+    for (int i = 0; i < n; ++i) speakerL[i] = speakerR[i] = 0.0f;
+
+    int got = 0;
+    float peak = 0.0f;
+    unsigned avail = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_speakerClipLock);
+        avail = speaker_queue_frames_locked();
+        if (!g_speakerClipStarted && avail < SPEAKER_QUEUE_PREFILL_FRAMES) {
+            if (outPeak) *outPeak = 0.0f;
+            if (outAvail) *outAvail = avail;
+            return 0;
+        }
+        if (!g_speakerClipStarted) g_speakerClipStarted = true;
+        for (int i = 0; i < n; ++i) {
+            while (!g_speakerClipQueue.empty()) {
+                SpeakerClipItem& front = g_speakerClipQueue.front();
+                if (front.pos < front.left.size()) break;
+                g_speakerClipQueue.pop_front();
+            }
+            if (g_speakerClipQueue.empty()) { g_speakerClipStarted = false; break; }
+            SpeakerClipItem& front = g_speakerClipQueue.front();
+            float l = front.left[front.pos];
+            float r = front.pos < front.right.size() ? front.right[front.pos] : l;
+            ++front.pos;
+            speakerL[i] = l;
+            speakerR[i] = r;
+            got = 1;
+            float a = fabsf(l); if (fabsf(r) > a) a = fabsf(r); if (a > peak) peak = a;
+        }
+    }
+    if (outPeak) *outPeak = peak;
+    if (outAvail) *outAvail = avail;
+    return got;
+}
+
 // DSP 回调：透传 + 降混单声道入环。务必防 in/out 为空、inch 异常。
 static std::atomic<int> g_dspLogged{0};
 static FMOD_RESULT dsp_read(FMOD_DSP_STATE_*, float* in, float* out, unsigned int length, int inch, int outch) {
@@ -730,9 +982,12 @@ static FMOD_RESULT dsp_read(FMOD_DSP_STATE_*, float* in, float* out, unsigned in
 }
 
 // 由 haptic_out 渲染线程调用：从环形缓冲连续读 n 个单声道样本
-extern "C" int haptic_pull_audio(float* outL, float* outR, int n) {
+extern "C" int haptic_pull_audio(float* speakerL, float* speakerR, float* hapticL, float* hapticR, int n) {
     float gate = g_gate.load(std::memory_order_relaxed);
-    int got = 0; float peak = 0;
+    float speakerPeak = 0.0f;
+    unsigned speakerAvailSnapshot = 0;
+    int got = pull_speaker_clip_queue(speakerL, speakerR, n, &speakerPeak, &speakerAvailSnapshot);
+    float peak = speakerPeak;
     unsigned avail = 0;
     {
         std::lock_guard<std::mutex> lock(g_ringLock);
@@ -745,7 +1000,7 @@ extern "C" int haptic_pull_audio(float* outL, float* outR, int n) {
         unsigned target = 3u * (unsigned)n;
         if (avail > target) {
             unsigned newRd = wr - target;
-            clear_mix_range(rd, newRd);
+            clear_haptic_range(rd, newRd);
             rd = newRd;
         }
         for (int i = 0; i < n; ++i) {
@@ -754,7 +1009,7 @@ extern "C" int haptic_pull_audio(float* outL, float* outR, int n) {
                 unsigned pos = rd & RMASK;
                 vl = g_ringL[pos] + g_ringGatedL[pos] * gate;
                 vr = g_ringR[pos] + g_ringGatedR[pos] * gate;
-                clear_mix_slot(rd);
+                clear_haptic_slot(rd);
                 ++rd;
                 got = 1;
             }
@@ -762,19 +1017,26 @@ extern "C" int haptic_pull_audio(float* outL, float* outR, int n) {
             if (gate < 0.0001f) gate = 0.0f;
             vl = soft_limit(vl);
             vr = soft_limit(vr);
-            outL[i] = vl;
-            outR[i] = vr;
+            hapticL[i] = vl;
+            hapticR[i] = vr;
             float a = fabsf(vl); if (fabsf(vr) > a) a = fabsf(vr); if (a > peak) peak = a;
         }
         g_rd.store(rd, std::memory_order_relaxed);
     }
     g_gate.store(gate, std::memory_order_relaxed);
     // 诊断：每约 300 次（~3s）报一次消费端
-    static std::atomic<int> pc{0}; static float pmax = 0; static unsigned amax = 0;
-    if (peak > pmax) pmax = peak; if (avail > amax) amax = avail;
-    // PULL 刷屏日志已关闭(每帧写会独占锁死文件+刷爆日志)。需要诊断时再开。
-    (void)pc; (void)pmax; (void)amax;
-    return (got && peak >= 0.004f) ? 1 : 0;
+    static std::atomic<int> pc{0}; static float pmax = 0; static unsigned amax = 0; static unsigned spkAmax = 0;
+    if (peak > pmax) pmax = peak; if (avail > amax) amax = avail; if (speakerAvailSnapshot > spkAmax) spkAmax = speakerAvailSnapshot;
+    if (pc.fetch_add(1) % 300 == 299) {
+        logf("PULL diag: peak=%.4f hAvailMax=%u spkAvailMax=%u spkPushBlocks=%u spkPushFrames=%u spkUnderflows=%u primed=%d",
+             pmax, amax, spkAmax,
+             g_speakerPushBlocks.exchange(0, std::memory_order_relaxed),
+             g_speakerPushFrames.exchange(0, std::memory_order_relaxed),
+             g_speakerUnderflows.exchange(0, std::memory_order_relaxed),
+             g_speakerPrimed ? 1 : 0);
+        pmax = 0; amax = 0; spkAmax = 0;
+    }
+    return got;
 }
 
 static std::atomic<int> g_chDspLogged{0};
@@ -782,26 +1044,42 @@ static const int DUMP_MAX_FRAMES = 48000 * 3;
 static std::mutex g_dumpLock;
 
 struct DspContext {
-    void* channel;
-    int idx;
-    float gain;
-    bool dump;
-    bool haptic;
-    unsigned mixCursor;
-    bool mixStarted;
-    unsigned hapticFrames;
-    unsigned quietFrames;
-    bool hapticDone;
-    float hpPrevIn;
-    float hpPrevOut;
-    float env;
+    void* channel = nullptr;
+    int idx = -1;
+    float gain = 1.0f;
+    bool dump = false;
+    bool haptic = false;
+    bool speaker = false;
+    bool speakerStreamStarted = false;
+    std::vector<float> speakerClipL;
+    std::vector<float> speakerClipR;
+    unsigned speakerClipFrames = 0;
+    unsigned speakerQuietFrames = 0;
+    bool speakerClipSubmitted = false;
+    unsigned mixCursor = 0;
+    bool mixStarted = false;
+    unsigned hapticFrames = 0;
+    unsigned quietFrames = 0;
+    bool hapticDone = false;
+    float hpPrevIn = 0.0f;
+    float hpPrevOut = 0.0f;
+    float env = 0.0f;
 };
 
 static std::unordered_map<void*, DspContext> g_dspContext;
+static std::mutex g_speakerBusLock;
+static std::unordered_map<void*, void*> g_speakerBusByParent;
+static std::unordered_map<void*, int> g_speakerChannelIdx;
+static void* g_speakerBusDsp = nullptr;
+static void* g_speakerBusSystem = nullptr;
+static std::atomic<int> g_busDspLogged{0};
 
 static const unsigned HAPTIC_FALLBACK_MAX_FRAMES = 48000 / 4; // 250ms：未知事件默认短促
 static const unsigned HAPTIC_QUIET_FRAMES = 48000 / 40;       // 25ms 低电平后停止
 static const float HAPTIC_QUIET_PEAK = 0.010f;
+static const unsigned SPEAKER_CLIP_MAX_FRAMES = 48000;        // 1s：完整捕获弹刀主层，避免 125ms 硬截断
+static const unsigned SPEAKER_CLIP_QUIET_FRAMES = 48000 / 80; // 12.5ms 静音后提交 clip
+static const float SPEAKER_CLIP_QUIET_PEAK = 0.004f;
 static const float HAPTIC_HP_A = 0.985f;       // 约 115Hz 高通，削掉持续嗡嗡的低频拖尾
 static const float HAPTIC_ENV_ATTACK = 0.45f;  // 快速抓瞬态
 static const float HAPTIC_ENV_DECAY = 0.965f;  // 快速回落，避免傻震
@@ -828,6 +1106,102 @@ static float shape_haptic_sample(float mono, DspContext& ctx) {
     if (shaped > 1.0f) shaped = 1.0f;
     if (shaped < -1.0f) shaped = -1.0f;
     return shaped;
+}
+
+static FMOD_RESULT speaker_bus_read(FMOD_DSP_STATE_*, float* in, float* out, unsigned int length, int inch, int outch) {
+    if (g_busDspLogged.exchange(1) == 0)
+        logf("BUSDSP first read: in=%p out=%p length=%u inch=%d outch=%d", in, out, length, inch, outch);
+    if (inch <= 0 || inch > 32) return 0;
+    int ch = (outch > 0 && outch < inch) ? outch : inch;
+    if (out && in) memcpy(out, in, (size_t)length * ch * sizeof(float));
+    if (!in) return 0;
+    float peak = 0.0f;
+    for (unsigned int i = 0; i < length; ++i) {
+        for (int c = 0; c < inch; ++c) {
+            float a = fabsf(in[i * inch + c]);
+            if (a > peak) peak = a;
+        }
+    }
+    if (peak < 0.0005f) return 0;
+    enqueue_speaker_block(in, length, inch, 9999);
+    return 0;
+}
+
+static void* ensure_speaker_bus_for_parent(void* system, void* parent) {
+    if (!system || !parent || !g_createCG || !g_addGroup || !g_addDSP || !g_createDSP) return nullptr;
+
+    std::lock_guard<std::mutex> lock(g_speakerBusLock);
+    auto it = g_speakerBusByParent.find(parent);
+    if (it != g_speakerBusByParent.end()) return it->second;
+
+    if (!g_speakerBusDsp || g_speakerBusSystem != system) {
+        FMOD_DSP_DESCRIPTION_ d{};
+        d.name[0] = 'd'; d.name[1] = 's'; d.name[2] = 'b'; d.name[3] = 'u'; d.name[4] = 's'; d.name[5] = 0;
+        d.version = 1; d.channels = 0; d.read = speaker_bus_read;
+        void* dsp = nullptr;
+        FMOD_RESULT cr = g_createDSP(system, &d, &dsp);
+        if (cr != 0 || !dsp) { logf("BUSDSP: CreateDSP failed r=%d", cr); return nullptr; }
+        g_speakerBusDsp = dsp;
+        g_speakerBusSystem = system;
+    }
+
+    void* bus = nullptr;
+    FMOD_RESULT cr = g_createCG(system, "ds_speaker_bus", &bus);
+    if (cr != 0 || !bus) { logf("BUSDSP: CreateChannelGroup failed r=%d parent=%p", cr, parent); return nullptr; }
+    FMOD_RESULT ar = g_addGroup(parent, bus);
+    if (ar != 0) { logf("BUSDSP: AddGroup failed r=%d parent=%p bus=%p", ar, parent, bus); return nullptr; }
+    void* dspConn = nullptr;
+    FMOD_RESULT dr = g_addDSP(bus, g_speakerBusDsp, &dspConn);
+    if (dr != 0) { logf("BUSDSP: AddDSP failed r=%d bus=%p dsp=%p", dr, bus, g_speakerBusDsp); return nullptr; }
+    g_speakerBusByParent[parent] = bus;
+    logf("BUSDSP: bus ready parent=%p bus=%p dsp=%p dspConn=%p", parent, bus, g_speakerBusDsp, dspConn);
+    return bus;
+}
+
+static void* ensure_speaker_bus_for_channel(void* system, void* channel) {
+    if (!system || !channel || !g_getCG) return nullptr;
+    void* parent = nullptr;
+    if (g_getCG(channel, &parent) != 0 || !parent) return nullptr;
+    return ensure_speaker_bus_for_parent(system, parent);
+}
+
+static float capture_speaker_clip(DspContext& ctx, const float* in, unsigned int length, int inch) {
+    if (!ctx.speaker || ctx.speakerClipSubmitted || !in || length == 0 || inch <= 0) return 0.0f;
+    unsigned remaining = ctx.speakerClipFrames < SPEAKER_CLIP_MAX_FRAMES ? SPEAKER_CLIP_MAX_FRAMES - ctx.speakerClipFrames : 0;
+    unsigned frames = length < remaining ? length : remaining;
+    if (frames == 0) return 0.0f;
+    if (ctx.speakerClipL.empty()) {
+        ctx.speakerClipL.reserve(SPEAKER_CLIP_MAX_FRAMES);
+        ctx.speakerClipR.reserve(SPEAKER_CLIP_MAX_FRAMES);
+    }
+
+    float peak = 0.0f;
+    for (unsigned int i = 0; i < frames; ++i) {
+        float l = 0.0f, r = 0.0f;
+        if (inch >= 2) {
+            l = in[i * inch];
+            r = in[i * inch + 1];
+        } else {
+            l = r = in[i * inch];
+        }
+        ctx.speakerClipL.push_back(l);
+        ctx.speakerClipR.push_back(r);
+        float a = fabsf(l); if (fabsf(r) > a) a = fabsf(r); if (a > peak) peak = a;
+    }
+    ctx.speakerClipFrames += frames;
+    if (peak < SPEAKER_CLIP_QUIET_PEAK && ctx.speakerClipFrames > 512) ctx.speakerQuietFrames += frames;
+    else if (peak >= SPEAKER_CLIP_QUIET_PEAK) ctx.speakerQuietFrames = 0;
+    return peak;
+}
+
+static float submit_speaker_clip(DspContext& ctx, const char* reason) {
+    if (!ctx.speaker || ctx.speakerClipSubmitted || ctx.speakerClipFrames == 0) return 0.0f;
+    float peak = enqueue_speaker_clip_to_ring(ctx.speakerClipL.data(), ctx.speakerClipR.data(), ctx.speakerClipFrames, ctx.idx);
+    logf("SPEAKER: submit clip idx=%d frames=%u quiet=%u peak=%.4f reason=%s", ctx.idx, ctx.speakerClipFrames,
+         ctx.speakerQuietFrames, peak, reason ? reason : "?");
+    ctx.speakerClipSubmitted = true;
+    ctx.speaker = false;
+    return peak;
 }
 
 struct ChannelDump {
@@ -912,10 +1286,36 @@ static FMOD_RESULT channel_tap_release(FMOD_DSP_STATE_* state) {
         state->plugindata = nullptr;
     }
     if (dsp) {
-        std::lock_guard<std::mutex> lock(g_dumpLock);
-        auto it = g_dspContext.find(dsp);
-        void* channel = it != g_dspContext.end() ? it->second.channel : nullptr;
-        g_dspContext.erase(dsp);
+        DspContext ctx;
+        bool haveCtx = false;
+        void* channel = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_dumpLock);
+            auto it = g_dspContext.find(dsp);
+            if (it != g_dspContext.end()) {
+                ctx.channel = it->second.channel;
+                ctx.idx = it->second.idx;
+                ctx.gain = it->second.gain;
+                ctx.dump = it->second.dump;
+                ctx.haptic = it->second.haptic;
+                ctx.mixCursor = it->second.mixCursor;
+                ctx.mixStarted = it->second.mixStarted;
+                ctx.hapticFrames = it->second.hapticFrames;
+                ctx.quietFrames = it->second.quietFrames;
+                ctx.hapticDone = it->second.hapticDone;
+                ctx.hpPrevIn = it->second.hpPrevIn;
+                ctx.hpPrevOut = it->second.hpPrevOut;
+                ctx.env = it->second.env;
+                ctx.speakerStreamStarted = it->second.speakerStreamStarted;
+                channel = it->second.channel;
+                haveCtx = true;
+                DspContext speakerCtx = std::move(it->second);
+                g_dspContext.erase(dsp);
+                if (speakerCtx.speaker && !speakerCtx.speakerClipSubmitted && speakerCtx.speakerClipFrames > 0) {
+                    submit_speaker_clip(speakerCtx, "release");
+                }
+            }
+        }
         if (channel) {
             std::lock_guard<std::mutex> slock(g_spatialLock);
             g_channelSpatial.erase(channel);
@@ -931,18 +1331,43 @@ static FMOD_RESULT channel_tap_read(FMOD_DSP_STATE_* state, float* in, float* ou
     int ch = (outch > 0 && outch < inch) ? outch : inch;
     if (out && in) memcpy(out, in, (size_t)length * ch * sizeof(float));
     if (!in) return 0;
-    DspContext ctx{ nullptr, -1, 1.0f, false, false, 0, false, 0, 0, false, 0.0f, 0.0f, 0.0f };
+    DspContext ctx;
     bool haveCtx = false;
     if (state) {
         std::lock_guard<std::mutex> lock(g_dumpLock);
         auto it = g_dspContext.find(state->instance);
-        if (it != g_dspContext.end()) { ctx = it->second; haveCtx = true; }
+        if (it != g_dspContext.end()) {
+            ctx.channel = it->second.channel;
+            ctx.idx = it->second.idx;
+            ctx.gain = it->second.gain;
+            ctx.dump = it->second.dump;
+            ctx.haptic = it->second.haptic;
+            ctx.mixCursor = it->second.mixCursor;
+            ctx.mixStarted = it->second.mixStarted;
+            ctx.hapticFrames = it->second.hapticFrames;
+            ctx.quietFrames = it->second.quietFrames;
+            ctx.hapticDone = it->second.hapticDone;
+            ctx.hpPrevIn = it->second.hpPrevIn;
+            ctx.hpPrevOut = it->second.hpPrevOut;
+            ctx.env = it->second.env;
+            ctx.speaker = it->second.speaker;
+            ctx.speakerStreamStarted = it->second.speakerStreamStarted;
+            haveCtx = true;
+        }
     }
     if (state && !state->plugindata) {
         state->plugindata = ctx.dump ? create_channel_dump(ctx.idx, ch) : nullptr;
     }
     if (state && state->plugindata) write_channel_dump((ChannelDump*)state->plugindata, in, length, inch);
     float peak = 0.0f;
+    if (ctx.speaker) {
+        if (!ctx.speakerStreamStarted) {
+            reset_speaker_stream_queue(ctx.idx);
+            ctx.speakerStreamStarted = true;
+        }
+        float speakerPeak = enqueue_speaker_block(in, length, inch, ctx.idx);
+        if (speakerPeak > peak) peak = speakerPeak;
+    }
     if (ctx.haptic && !ctx.hapticDone) {
         unsigned maxFrames = haptic_max_frames_for_idx(ctx.idx);
         unsigned remaining = ctx.hapticFrames < maxFrames ? maxFrames - ctx.hapticFrames : 0;
@@ -998,20 +1423,21 @@ static FMOD_RESULT channel_tap_read(FMOD_DSP_STATE_* state, float* in, float* ou
             ctx.haptic = false;
             logf("CHDSP: haptic stop idx=%d frames=%u quiet=%u peak=%.4f", ctx.idx, ctx.hapticFrames, ctx.quietFrames, blockPeak);
         }
-        if (state && haveCtx) {
-            std::lock_guard<std::mutex> lock(g_dumpLock);
-            auto it = g_dspContext.find(state->instance);
-            if (it != g_dspContext.end()) {
-                it->second.mixCursor = ctx.mixCursor;
-                it->second.mixStarted = ctx.mixStarted;
-                it->second.hapticFrames = ctx.hapticFrames;
-                it->second.quietFrames = ctx.quietFrames;
-                it->second.hapticDone = ctx.hapticDone;
-                it->second.haptic = ctx.haptic;
-                it->second.hpPrevIn = ctx.hpPrevIn;
-                it->second.hpPrevOut = ctx.hpPrevOut;
-                it->second.env = ctx.env;
-            }
+    }
+    if (state && haveCtx) {
+        std::lock_guard<std::mutex> lock(g_dumpLock);
+        auto it = g_dspContext.find(state->instance);
+        if (it != g_dspContext.end()) {
+            it->second.mixCursor = ctx.mixCursor;
+            it->second.mixStarted = ctx.mixStarted;
+            it->second.speakerStreamStarted = ctx.speakerStreamStarted;
+            it->second.hapticFrames = ctx.hapticFrames;
+            it->second.quietFrames = ctx.quietFrames;
+            it->second.hapticDone = ctx.hapticDone;
+            it->second.haptic = ctx.haptic;
+            it->second.hpPrevIn = ctx.hpPrevIn;
+            it->second.hpPrevOut = ctx.hpPrevOut;
+            it->second.env = ctx.env;
         }
     }
     static std::atomic<int> pc{0}; static float pmax = 0;
@@ -1020,7 +1446,7 @@ static FMOD_RESULT channel_tap_read(FMOD_DSP_STATE_* state, float* in, float* ou
     return 0;
 }
 
-static bool attach_channel_tap(void* system, void* channel, int subIdx, float gain, bool dump, bool haptic) {
+static bool attach_channel_tap(void* system, void* channel, int subIdx, float gain, bool dump, bool haptic, bool speaker) {
     if (!system || !channel || !g_createDSP || !g_chAddDSP) return false;
     FMOD_DSP_DESCRIPTION_ d{};
     d.name[0] = 'c'; d.name[1] = 'h'; d.name[2] = 't'; d.name[3] = 'a'; d.name[4] = 'p'; d.name[5] = 0;
@@ -1030,7 +1456,14 @@ static bool attach_channel_tap(void* system, void* channel, int subIdx, float ga
     if (cr != 0 || !dsp) { logf("CHDSP: CreateDSP failed r=%d channel=%p idx=%d", cr, channel, subIdx); return false; }
     {
         std::lock_guard<std::mutex> lock(g_dumpLock);
-        g_dspContext[dsp] = DspContext{ channel, subIdx, gain, dump, haptic, 0, false, 0, 0, false, 0.0f, 0.0f, 0.0f };
+        DspContext ctx;
+        ctx.channel = channel;
+        ctx.idx = subIdx;
+        ctx.gain = gain;
+        ctx.dump = dump;
+        ctx.haptic = haptic;
+        ctx.speaker = speaker;
+        g_dspContext[dsp] = ctx;
     }
     void* conn = nullptr;
     FMOD_RESULT ar = g_chAddDSP(channel, dsp, &conn);
@@ -1043,7 +1476,8 @@ static bool attach_channel_tap(void* system, void* channel, int subIdx, float ga
         if (g_dspRelease) g_dspRelease(dsp);
         return false;
     }
-    logf("CHDSP: attached channel=%p dsp=%p conn=%p idx=%d gain=%.2f dump=%d haptic=%d (%s)", channel, dsp, conn, subIdx, gain, dump ? 1 : 0, haptic ? 1 : 0, sound_meaning(subIdx));
+    logf("CHDSP: attached channel=%p dsp=%p conn=%p idx=%d gain=%.2f dump=%d haptic=%d speaker=%d (%s)",
+         channel, dsp, conn, subIdx, gain, dump ? 1 : 0, haptic ? 1 : 0, speaker ? 1 : 0, sound_meaning(subIdx));
     return true;
 }
 
@@ -1177,15 +1611,31 @@ extern "C" FMOD_RESULT playSound_detour(void* self, int channelid, void* sound, 
     { std::lock_guard<std::mutex> g(g_lock); auto it = g_subIndex.find(sound); if (it != g_subIndex.end()) subIdx = it->second; }
     HapticDecision haptic = decide_haptic(subIdx, bank, verdict[0] == 'V');
     bool shouldHaptic = haptic.enabled;
-    int playPaused = shouldHaptic ? 1 : paused;
+    int playPaused = (shouldHaptic || haptic.speaker) ? 1 : paused;
     FMOD_RESULT r = g_playSound(self, channelid, sound, playPaused, channel);
 
     record_seen_effect(subIdx, bank, subname, verdict, shouldHaptic, haptic.gain);
-    logf("PLAY  ch=%d sound=%p bank=%s sub=\"%s\" -> %s  idx=%d gain=%.2f dump=%d (%s)",
-         channelid, sound, bank.c_str(), subname, verdict, subIdx, haptic.gain, haptic.dump ? 1 : 0, subIdx >= 0 ? sound_meaning(subIdx) : "-");
+        logf("PLAY  ch=%d sound=%p bank=%s sub=\"%s\" -> %s  idx=%d gain=%.2f dump=%d speaker=%d suppressed=%d (%s)",
+         channelid, sound, bank.c_str(), subname, verdict, subIdx, haptic.gain, haptic.dump ? 1 : 0,
+            haptic.speaker ? 1 : 0, haptic.speakerSuppressed ? 1 : 0, subIdx >= 0 ? sound_meaning(subIdx) : "-");
     if (haptic.attach) {
-        if (shouldHaptic) ensure_haptic();
-        bool tapped = (r == 0 && channel && *channel) ? attach_channel_tap(self, *channel, subIdx, haptic.gain, haptic.dump, shouldHaptic) : false;
+        if (shouldHaptic || haptic.speaker) ensure_haptic();
+        bool busSpeaker = false;
+        if (r == 0 && channel && *channel && haptic.speaker) {
+            reset_speaker_stream_queue(subIdx);
+            void* bus = ensure_speaker_bus_for_channel(self, *channel);
+            if (bus && g_setCG && g_setCG(*channel, bus) == 0) {
+                busSpeaker = true;
+                {
+                    std::lock_guard<std::mutex> slock(g_speakerBusLock);
+                    g_speakerChannelIdx[*channel] = subIdx;
+                }
+                logf("BUSDSP: route speaker channel=%p idx=%d bus=%p", *channel, subIdx, bus);
+            } else {
+                logf("BUSDSP: route failed channel=%p idx=%d bus=%p", *channel, subIdx, bus);
+            }
+        }
+        bool tapped = (r == 0 && channel && *channel) ? attach_channel_tap(self, *channel, subIdx, haptic.gain, haptic.dump, shouldHaptic, haptic.speaker && !busSpeaker) : false;
         if (g_chSetPaused && channel && *channel)
             g_chSetPaused(*channel, paused ? 1 : 0);
         if (shouldHaptic && !tapped) {
@@ -1209,6 +1659,40 @@ extern "C" FMOD_RESULT channelSetSpeakerMix_detour(void* channel, float fl, floa
     ensure_init();
     update_speaker_spatial(channel, fl, fr, center, lfe, bl, br, sl, sr);
     return g_chSetSpeakerMix ? g_chSetSpeakerMix(channel, fl, fr, center, lfe, bl, br, sl, sr) : -1;
+}
+
+static FMOD_RESULT route_set_channel_group(void* channel, void* group, SetCG_t next) {
+    ensure_init();
+    int speakerIdx = -1;
+    {
+        std::lock_guard<std::mutex> lock(g_speakerBusLock);
+        auto it = g_speakerChannelIdx.find(channel);
+        if (it != g_speakerChannelIdx.end()) speakerIdx = it->second;
+    }
+    if (speakerIdx >= 0 && group && g_capSystem) {
+        void* bus = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_speakerBusLock);
+            auto it = g_speakerBusByParent.find(group);
+            if (it != g_speakerBusByParent.end()) bus = it->second;
+        }
+        if (!bus) {
+            bus = ensure_speaker_bus_for_parent(g_capSystem, group);
+        }
+        if (bus) {
+            logf("BUSDSP: preserve route channel=%p idx=%d parent=%p bus=%p", channel, speakerIdx, group, bus);
+            return next ? next(channel, bus) : -1;
+        }
+    }
+    return next ? next(channel, group) : -1;
+}
+
+extern "C" FMOD_RESULT channelSetChannelGroup_detour(void* channel, void* group) {
+    return route_set_channel_group(channel, group, g_setCG);
+}
+
+extern "C" FMOD_RESULT channelSetChannelGroupCpp_detour(void* channel, void* group) {
+    return route_set_channel_group(channel, group, g_setCGCpp ? g_setCGCpp : g_setCG);
 }
 
 extern "C" FMOD_RESULT channelSet3DAttributes_detour(void* channel, const FMOD_VECTOR_* pos, const FMOD_VECTOR_* vel) {
@@ -1248,7 +1732,10 @@ static void do_init() {
     g_createCG  = (CreateCG_t)  GetProcAddress(g_orig, "FMOD_System_CreateChannelGroup");
     g_createDSP = (CreateDSP_t) GetProcAddress(g_orig, "FMOD_System_CreateDSP");
     g_addDSP    = (AddDSP_t)    GetProcAddress(g_orig, "FMOD_ChannelGroup_AddDSP");
+    g_addGroup  = (AddGroup_t)  GetProcAddress(g_orig, "FMOD_ChannelGroup_AddGroup");
     g_setCG     = (SetCG_t)     GetProcAddress(g_orig, "FMOD_Channel_SetChannelGroup");
+    g_setCGCpp  = (SetCG_t)     GetProcAddress(g_orig, "?setChannelGroup@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@PEAVChannelGroup@2@@Z");
+    g_getCG     = (GetCG_t)     GetProcAddress(g_orig, "FMOD_Channel_GetChannelGroup");
     g_getMaster = (GetMaster_t) GetProcAddress(g_orig, "FMOD_System_GetMasterChannelGroup");
     g_chAddDSP    = (ChannelAddDSP_t)   GetProcAddress(g_orig, "FMOD_Channel_AddDSP");
     g_chSetPaused = (ChannelSetPaused_t)GetProcAddress(g_orig, "FMOD_Channel_SetPaused");
@@ -1274,6 +1761,8 @@ static void do_init() {
          g_orig, g_createSound, g_createStream, g_createSoundInternal, g_playSound, g_getName, g_getParent);
         logf("haptic funcs: createDSP=%p chAddDSP=%p chSetPaused=%p dspRelease=%p",
             g_createDSP, g_chAddDSP, g_chSetPaused, g_dspRelease);
+    logf("bus funcs: createCG=%p addGroup=%p setCG=%p getCG=%p addDSP=%p",
+         g_createCG, g_addGroup, g_setCG, g_getCG, g_addDSP);
     logf("spatial funcs: setPan=%p setSpeakerMix=%p set3D=%p", g_chSetPan, g_chSetSpeakerMix, g_chSet3DAttributes);
     if (!g_createSound || !g_playSound)
         logf("WARNING: 关键函数指针为空，导出名可能与本机 fmodex64.dll 不符，需重新核对");

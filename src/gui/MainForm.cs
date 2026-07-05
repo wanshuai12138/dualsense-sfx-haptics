@@ -285,8 +285,9 @@ public class MainForm : Form
         var root = new JsonObject {
             ["enabled"] = true,
             ["defaultGain"] = 1.0,
-                ["dumpEnabled"] = true,
-                ["useBuiltinDefaults"] = false,
+            ["dumpEnabled"] = true,
+            ["useBuiltinDefaults"] = false,
+            ["speakerEnabled"] = true,
             ["effects"] = new JsonObject()
         };
         File.WriteAllText(HapticsConfigFile, root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
@@ -368,6 +369,13 @@ public class MainForm : Form
             if (gridEffects.IsCurrentCellDirty) gridEffects.CommitEdit(DataGridViewDataErrorContexts.Commit);
             gridEffects.EndEdit();
             Directory.CreateDirectory(AppDir);
+            bool speakerEnabled = true;
+            try
+            {
+                if (File.Exists(HapticsConfigFile) && JsonNode.Parse(File.ReadAllText(HapticsConfigFile)) is JsonObject existingRoot)
+                    speakerEnabled = existingRoot["speakerEnabled"]?.GetValue<bool>() ?? speakerEnabled;
+            }
+            catch { }
             var effects = new JsonObject();
             foreach (DataGridViewRow row in gridEffects.Rows)
             {
@@ -394,6 +402,7 @@ public class MainForm : Form
                 ["defaultGain"] = (double)numDefaultGain.Value,
                 ["dumpEnabled"] = chkDumpEnabled.Checked,
                 ["useBuiltinDefaults"] = chkUseBuiltinDefaults.Checked,
+                ["speakerEnabled"] = speakerEnabled,
                 ["effects"] = effects
             };
             File.WriteAllText(HapticsConfigFile, root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));

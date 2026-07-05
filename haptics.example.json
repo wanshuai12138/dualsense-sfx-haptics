@@ -3,5 +3,6 @@
   "defaultGain": 1.0,
   "dumpEnabled": true,
   "useBuiltinDefaults": false,
+  "speakerEnabled": true,
   "effects": {}
 }

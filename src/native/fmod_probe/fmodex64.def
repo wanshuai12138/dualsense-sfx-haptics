@@ -280,7 +280,7 @@ EXPORTS
     ?setBypass@DSP@FMOD@@QEAA?AW4FMOD_RESULT@@_N@Z=thunk_274 @278
     ?setCallback@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@P6A?AW43@PEAUFMOD_CHANNEL@@W4FMOD_CHANNEL_CALLBACKTYPE@@PEAX2@Z@Z=thunk_275 @279
     ?setCallback@System@FMOD@@QEAA?AW4FMOD_RESULT@@P6A?AW43@PEAUFMOD_SYSTEM@@W4FMOD_SYSTEM_CALLBACKTYPE@@PEAX2@Z@Z=thunk_276 @280
-    ?setChannelGroup@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@PEAVChannelGroup@2@@Z=thunk_277 @281
+    ?setChannelGroup@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@PEAVChannelGroup@2@@Z=channelSetChannelGroupCpp_detour @281
     ?setDSPBufferSize@System@FMOD@@QEAA?AW4FMOD_RESULT@@IH@Z=thunk_278 @282
     ?setDefaults@DSP@FMOD@@QEAA?AW4FMOD_RESULT@@MMMH@Z=thunk_279 @283
     ?setDefaults@Sound@FMOD@@QEAA?AW4FMOD_RESULT@@MMMH@Z=thunk_280 @284
@@ -446,7 +446,7 @@ EXPORTS
     FMOD_Channel_Set3DPanLevel=thunk_440 @444
     FMOD_Channel_Set3DSpread=thunk_441 @445
     FMOD_Channel_SetCallback=thunk_442 @446
-    FMOD_Channel_SetChannelGroup=thunk_443 @447
+    FMOD_Channel_SetChannelGroup=channelSetChannelGroup_detour @447
     FMOD_Channel_SetDelay=thunk_444 @448
     FMOD_Channel_SetFrequency=thunk_445 @449
     FMOD_Channel_SetInputChannelMix=thunk_446 @450

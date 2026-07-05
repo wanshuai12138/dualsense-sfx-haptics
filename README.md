@@ -285,13 +285,16 @@ wav_write_header(FILE* f, int channels, int frames)
 ```text
 channel_tap_read
         -> push_audio_to_ring       # 按输出时间轴叠加到 mixer ring
+          -> push_speaker_to_ring     # 弹刀/格挡原始 PCM 直通到手柄喇叭
   -> haptic_pull_audio
         -> soft limiter
   -> WASAPI render thread
-  -> DualSense ch3/ch4 或 CABLE Input
+  -> DualSense ch1/ch2 喇叭 + ch3/ch4 触觉，或 CABLE Input
 ```
 
 多个启用音效同时触发时，不再按回调顺序排队串起来，而是写到同一条短延迟时间轴上叠加。`haptic_pull_audio` 读取后会清空已消费样本，并对混合结果做 soft limiter，减少削顶导致的硬、糊、怪。
+
+弹刀/格挡组（idx 665-700）会额外复制一份原始 FMOD Channel PCM 到 DualSense ch1/ch2，用于手柄喇叭播放；这一路不做触觉整形、不截短、不低通、不空间权重处理，只做必要的 WASAPI 声道写入。CABLE/DSX 两声道路线不会混入这份喇叭音频。
 
 每个触觉 Channel 还会先做触觉整形：约 115Hz 高通去掉低频拖尾，快速包络突出瞬态起点，再进入 mixer。事件寿命按 idx 分组压短，例如弹刀/危攻约 125ms，处决/受伤约 200ms，未知事件约 250ms；连续约 25ms 低电平后也会自动停止。这样弹刀、处决这类瞬态音效不会因为 FMOD Channel 尾巴、循环残留或低电平噪声一直震动；WAV 录音仍保持完整，方便继续试听标注。
 

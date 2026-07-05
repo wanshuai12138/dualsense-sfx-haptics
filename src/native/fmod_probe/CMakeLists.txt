@@ -3,18 +3,26 @@ project(fmod_probe CXX ASM_MASM)
 
 # 必须 64 位（只狼是 x64，fmodex64.dll 也是 x64）
 # thunks.asm: 360 个 jmp 跳转桩（自动生成），导出修饰名直接 jmp 到原函数
-# haptic_out.cpp: WASAPI 写 DualSense ch3/4 触觉音圈
+# haptic_out.cpp: miniaudio callback 写 DualSense ch2 喇叭 + ch3/4 触觉音圈
 add_library(fmodex64 SHARED dllmain.cpp thunks.asm haptic_out.cpp)
 add_executable(ds_speaker_beep ../haptic_test/ds_speaker_beep.cpp)
+add_executable(ds_speaker_wav ../haptic_test/ds_speaker_wav.cpp)
+
+set(MINIAUDIO_ROOT "D:/wanproject/DualSenseY-v2-master (2)/thirdparty/miniaudio")
 
 # 输出文件名固定为 fmodex64.dll
 set_target_properties(fmodex64 PROPERTIES
     OUTPUT_NAME "fmodex64"
     PREFIX "")
 
-# WASAPI 触觉输出需要的库
+# miniaudio/WASAPI 触觉输出需要的库
+target_sources(fmodex64 PRIVATE "${MINIAUDIO_ROOT}/src/miniaudio.cpp")
+target_sources(ds_speaker_wav PRIVATE "${MINIAUDIO_ROOT}/src/miniaudio.cpp")
+target_include_directories(fmodex64 PRIVATE "${MINIAUDIO_ROOT}/include")
+target_include_directories(ds_speaker_wav PRIVATE "${MINIAUDIO_ROOT}/include")
 target_link_libraries(fmodex64 PRIVATE ole32 avrt)
 target_link_libraries(ds_speaker_beep PRIVATE ole32 avrt)
+target_link_libraries(ds_speaker_wav PRIVATE ole32 avrt)
 
 # 用 .def 控制导出：706 个转发 + 3 个拦截
 target_link_options(fmodex64 PRIVATE
@@ -22,10 +30,12 @@ target_link_options(fmodex64 PRIVATE
 
 set_property(TARGET fmodex64 PROPERTY CXX_STANDARD 17)
 set_property(TARGET ds_speaker_beep PROPERTY CXX_STANDARD 17)
+set_property(TARGET ds_speaker_wav PROPERTY CXX_STANDARD 17)
 
 if (MSVC)
     target_compile_options(fmodex64 PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
     target_compile_options(ds_speaker_beep PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+    target_compile_options(ds_speaker_wav PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
 endif()
 
 # 构建示例：
